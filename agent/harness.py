@@ -33,6 +33,7 @@ tool_calls, or when MAX_TOOL_ITERATIONS is hit.
 """
 import json
 import re
+from functools import lru_cache
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -143,6 +144,15 @@ def build_system_prompt(ticket_type: str, customer_id: str, policy_context: str,
     )
 
 
+@lru_cache(maxsize=1)
+def _shared_retriever() -> HybridPolicyRetriever:
+    """The policy corpus never changes between tickets, so build the BM25
+    index and load the embedding model exactly once per process and reuse it
+    across every SupportHarness session, instead of paying that startup cost
+    (most visibly, reloading the embedding model) on every single ticket."""
+    return HybridPolicyRetriever(Path(__file__).resolve().parent.parent / "policies")
+
+
 class SupportHarness:
     def __init__(self, customer_id: str, provider: GroqProvider | None = None):
         accounts = json.loads((DATA_DIR / "accounts.json").read_text(encoding="utf-8"))
@@ -151,7 +161,7 @@ class SupportHarness:
 
         self.customer_id = customer_id
         self.provider = provider or GroqProvider()
-        self.retriever = HybridPolicyRetriever(Path(__file__).resolve().parent.parent / "policies")
+        self.retriever = _shared_retriever()
         self.long_term = LongTermMemory(DATA_DIR / "ticket_history.json")
         self.short_term = ShortTermMemory()
         self.audit_log: list[dict] = []
