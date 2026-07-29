@@ -1,0 +1,28 @@
+{
+  "CUST001": [
+    {
+      "date": "2026-05-02",
+      "type": "delivery_issue",
+      "summary": "Reported a delayed shipment for a keyboard order; issued a $10 shipping credit per policy."
+    }
+  ],
+  "CUST003": [
+    {
+      "date": "2026-06-01",
+      "type": "subscription_account",
+      "summary": "Account was flagged for a suspected chargeback dispute; customer submitted an appeal, still under review."
+    },
+    {
+      "date": "2026-07-09",
+      "type": "refund_request",
+      "summary": "Refund approved for a damaged headphone order (ORD-old-991), within the 30-day window."
+    }
+  ],
+  "CUST005": [
+    {
+      "date": "2026-07-01",
+      "type": "subscription_account",
+      "summary": "Account suspended for repeated failed payment attempts on the Plus subscription. No appeal filed yet."
+    }
+  ]
+}

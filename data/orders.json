@@ -1,0 +1,66 @@
+{
+  "ORD1001": {
+    "order_id": "ORD1001",
+    "customer_id": "CUST001",
+    "status": "delivered",
+    "items": ["Wireless Mouse", "USB-C Cable"],
+    "order_date": "2026-07-10",
+    "delivery_date": "2026-07-14"
+  },
+  "ORD1002": {
+    "order_id": "ORD1002",
+    "customer_id": "CUST002",
+    "status": "in_transit",
+    "items": ["Mechanical Keyboard"],
+    "order_date": "2026-07-20",
+    "delivery_date": "2026-08-02"
+  },
+  "ORD1003": {
+    "order_id": "ORD1003",
+    "customer_id": "CUST001",
+    "status": "delayed",
+    "items": ["27-inch Monitor"],
+    "order_date": "2026-07-05",
+    "delivery_date": "2026-07-15"
+  },
+  "ORD1004": {
+    "order_id": "ORD1004",
+    "customer_id": "CUST003",
+    "status": "delivered",
+    "items": ["Bluetooth Headphones"],
+    "order_date": "2026-06-28",
+    "delivery_date": "2026-07-02"
+  },
+  "ORD1005": {
+    "order_id": "ORD1005",
+    "customer_id": "CUST004",
+    "status": "delivered_damaged",
+    "items": ["Desk Lamp"],
+    "order_date": "2026-07-12",
+    "delivery_date": "2026-07-16"
+  },
+  "ORD1006": {
+    "order_id": "ORD1006",
+    "customer_id": "CUST002",
+    "status": "processing",
+    "items": ["Webcam", "Ring Light"],
+    "order_date": "2026-07-27",
+    "delivery_date": "2026-08-05"
+  },
+  "ORD1007": {
+    "order_id": "ORD1007",
+    "customer_id": "CUST005",
+    "status": "delivered",
+    "items": ["Standing Desk"],
+    "order_date": "2026-06-15",
+    "delivery_date": "2026-06-22"
+  },
+  "ORD1008": {
+    "order_id": "ORD1008",
+    "customer_id": "CUST003",
+    "status": "lost_in_transit",
+    "items": ["Graphic Tablet"],
+    "order_date": "2026-07-08",
+    "delivery_date": "2026-07-13"
+  }
+}

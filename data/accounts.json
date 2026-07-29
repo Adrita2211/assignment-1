@@ -1,0 +1,37 @@
+{
+  "CUST001": {
+    "customer_id": "CUST001",
+    "name": "Jordan Lee",
+    "standing": "active",
+    "subscription": "Prime-style Plus (monthly)",
+    "order_history": ["ORD1001", "ORD1003"]
+  },
+  "CUST002": {
+    "customer_id": "CUST002",
+    "name": "Sam Rivera",
+    "standing": "active",
+    "subscription": "none",
+    "order_history": ["ORD1002", "ORD1006"]
+  },
+  "CUST003": {
+    "customer_id": "CUST003",
+    "name": "Priya Nair",
+    "standing": "flagged",
+    "subscription": "Plus (annual)",
+    "order_history": ["ORD1004", "ORD1008"]
+  },
+  "CUST004": {
+    "customer_id": "CUST004",
+    "name": "Marcus Chen",
+    "standing": "active",
+    "subscription": "none",
+    "order_history": ["ORD1005"]
+  },
+  "CUST005": {
+    "customer_id": "CUST005",
+    "name": "Elena Petrova",
+    "standing": "suspended",
+    "subscription": "Plus (monthly)",
+    "order_history": ["ORD1007"]
+  }
+}
