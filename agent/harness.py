@@ -1,16 +1,40 @@
-"""The harness loop.
+"""The harness loop, as a LangGraph StateGraph.
 
 This is the one file where the "LLM proposes, harness decides" pattern has
-to be real. The model (via GroqProvider) proposes tool calls as structured
-tool_call objects; SupportHarness._check_permission runs BEFORE any of those
-proposals reach the MCP client, using data the harness loaded itself
-(data/orders.json, data/accounts.json), not data the model supplied. A
-rejected call never reaches agent/mcp_client.py at all -- it gets a
-synthetic tool_result telling the model why, and the loop continues. That is
-the exact line referenced in the assignment's grading note:
-_check_permission, called from handle_turn, before self.mcp_client.call_tool.
+to be real. The graph shape is:
 
-Security layers, in the order a proposed call actually passes through:
+    classify -> retrieve -> memory -> decide
+                                          |
+                          (conditional edge: any tool calls proposed?)
+                                          |
+                       no tool calls -> respond -> END
+                                          |
+                                     tool calls
+                                          |
+                                       validate  <-- permission checks live
+                                          |          HERE, structurally
+                                          v          between decide and act,
+                                        act          never inside the
+                                          |          decide/LLM node.
+                     (conditional edge: iteration cap hit?)
+                            |                    |
+                       decide (loop)         respond -> END
+
+`validate` is the node the assignment calls "a conditional edge between
+decide and act": LangGraph's routing functions (the things passed to
+`add_conditional_edges`) can only choose the next node, they can't also
+produce state updates, so the actual permission-check *logic*
+(`SupportHarness._validate_and_check_permission`) has to live in a node
+rather than in the router callback itself. `validate` is that node -- it
+sits on every path from `decide` to `act`, runs before `act` ever touches
+`agent/mcp_client.py`, and is a completely separate node from `decide` (the
+only node that talks to the LLM). A rejected call never reaches
+`act`'s MCP dispatch at all -- `act` still runs (it has to feed a rejection
+`tool_result` back to the model), but for a rejected call it never calls
+`self.mcp_client.call_tool(...)`.
+
+Security layers, in the order a proposed call actually passes through
+`validate` (see `SupportHarness._validate_and_check_permission`):
   1. Tool allowlist -- the tool name must be one of the two known tools.
   2. Schema/shape validation -- a pydantic model with extra="forbid" rejects
      missing fields, wrong types, or unexpected extra keys, independent of
@@ -19,23 +43,21 @@ Security layers, in the order a proposed call actually passes through:
      ID pattern (ORD\\d+ / CUST\\d+), catching garbage input cheaply.
   4. Ownership check -- the resolved order/customer must belong to THIS
      ticket's authenticated customer_id.
-Only a call that clears all four is dispatched to MCP. Every decision
-(allowed or rejected, and why) is appended to self.audit_log.
+Only a call that clears all four is dispatched to MCP inside `act`. Every
+decision (allowed or rejected, and why) is appended to self.audit_log.
 
 A per-turn tool-call round-trip cap (MAX_TOOL_ITERATIONS) stops a
-misbehaving or adversarial model from looping tool calls indefinitely.
-
-Per-turn flow: classify -> retrieve (hybrid RAG) -> decide (model proposes
-0+ tool calls) -> [harness validates + permission-checks each] -> act (MCP
-call for allowed ones) -> respond. Steps repeat while the model keeps
-proposing tool calls; it ends the turn by returning plain text with no
-tool_calls, or when MAX_TOOL_ITERATIONS is hit.
+misbehaving or adversarial model from looping tool calls indefinitely --
+enforced by the conditional edge after `act`.
 """
 import json
 import re
 from functools import lru_cache
 from pathlib import Path
+from typing import Optional, TypedDict
 
+from langchain_core.runnables import RunnableConfig
+from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from agent.classify import classify_ticket
@@ -153,6 +175,243 @@ def _shared_retriever() -> HybridPolicyRetriever:
     return HybridPolicyRetriever(Path(__file__).resolve().parent.parent / "policies")
 
 
+# --- Graph state ------------------------------------------------------------
+# Everything a node needs to read or write for a single handle_turn() call.
+# Instance-specific dependencies (provider, retriever, mcp_client, audit_log,
+# ...) are NOT part of this state -- they're reached via
+# config["configurable"]["harness"], so the compiled graph itself stays a
+# stateless singleton shared across every SupportHarness session, the same
+# way _shared_retriever() is shared.
+
+class TurnState(TypedDict):
+    messages: list[dict]              # the full short-term buffer, OpenAI chat format
+    customer_id: str
+    ticket_type: str
+    policy_context: str
+    history_summary: str
+    pending_tool_calls: list[dict]    # tool calls proposed by the last `decide` call
+    validated_calls: list[dict]       # `validate`'s output: allow/reject decision per call
+    iteration_count: int
+    final_text: Optional[str]
+
+
+def _get_harness(config: RunnableConfig) -> "SupportHarness":
+    return config["configurable"]["harness"]
+
+
+def _latest_user_text(messages: list[dict]) -> str:
+    for m in reversed(messages):
+        if m["role"] == "user":
+            return m["content"]
+    return ""
+
+
+_RETRIEVAL_CONTEXT_WINDOW = 4  # last N user/assistant turns, not just this message
+
+
+def _retrieval_query(messages: list[dict]) -> str:
+    """A vague follow-up ("tell me the policy on this") has no topical
+    content by itself -- its subject lives in the preceding turn(s). Build
+    the retrieval query from the last few user/assistant turns (skipping
+    tool-call/tool-result messages, which aren't natural-language text)
+    instead of just the single latest message, so a short follow-up can
+    still retrieve the right doc."""
+    recent = [
+        m for m in messages
+        if m["role"] in ("user", "assistant") and isinstance(m.get("content"), str) and m["content"]
+    ]
+    return "\n".join(m["content"] for m in recent[-_RETRIEVAL_CONTEXT_WINDOW:])
+
+
+# --- Nodes -------------------------------------------------------------------
+
+async def classify_node(state: TurnState, config: RunnableConfig) -> dict:
+    ticket_type = classify_ticket(_latest_user_text(state["messages"]))
+    print(f"[CLASSIFY] ticket_type={ticket_type}")
+    return {"ticket_type": ticket_type}
+
+
+async def retrieve_node(state: TurnState, config: RunnableConfig) -> dict:
+    """Try the current message alone first -- that's the strongest, least
+    noisy signal, and is what every accuracy test was tuned against. Only
+    fall back to a multi-turn context window if the message alone retrieves
+    nothing: concatenating several turns unconditionally was tried and
+    reverted, because a verbose prior turn's vocabulary (e.g. an earlier
+    escalation reply full of unrelated words) can outweigh and misrank a
+    perfectly well-formed new question that would have retrieved correctly
+    on its own."""
+    harness = _get_harness(config)
+    current_text = _latest_user_text(state["messages"])
+    hits = harness.retriever.retrieve(current_text, top_k=2)
+    used_context = False
+
+    if not hits:
+        context_query = _retrieval_query(state["messages"])
+        if context_query != current_text:
+            hits = harness.retriever.retrieve(context_query, top_k=2)
+            used_context = bool(hits)
+
+    if hits:
+        policy_context = "\n\n".join(f"[{doc['id']}] {doc['text']}" for doc, _ in hits)
+        tag = " (via conversation context fallback)" if used_context else ""
+        print(f"[RAG] retrieved{tag}: {[(doc['id'], score) for doc, score in hits]}")
+    else:
+        policy_context = "(No policy document in the knowledge base is relevant to this question.)"
+        print("[RAG] no relevant chunk found above threshold -- honest gap")
+    return {"policy_context": policy_context}
+
+
+async def memory_node(state: TurnState, config: RunnableConfig) -> dict:
+    harness = _get_harness(config)
+    history_summary = harness.long_term.get_history_summary(harness.customer_id)
+    print(f"[MEMORY] long-term (customer_id={harness.customer_id}): {history_summary}")
+    print(f"[MEMORY] short-term buffer size before this turn: {len(state['messages']) - 1} messages")
+    return {"history_summary": history_summary}
+
+
+async def decide_node(state: TurnState, config: RunnableConfig) -> dict:
+    """The only node that talks to the LLM. It proposes tool calls; it does
+    NOT decide whether they're allowed to run -- that's `validate`'s job."""
+    harness = _get_harness(config)
+    system_msg = {
+        "role": "system",
+        "content": build_system_prompt(
+            state["ticket_type"], state["customer_id"], state["policy_context"], state["history_summary"]
+        ),
+    }
+    result = harness.provider.call([system_msg] + state["messages"], tools=TOOLS)
+
+    if result["tool_calls"]:
+        assistant_msg = {
+            "role": "assistant",
+            "content": result["text"],
+            "tool_calls": [
+                {
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {"name": tc["name"], "arguments": json.dumps(tc["arguments"])},
+                }
+                for tc in result["tool_calls"]
+            ],
+        }
+        return {
+            "messages": state["messages"] + [assistant_msg],
+            "pending_tool_calls": result["tool_calls"],
+        }
+
+    final_text = result["text"] or ""
+    return {
+        "messages": state["messages"] + [{"role": "assistant", "content": final_text}],
+        "pending_tool_calls": [],
+        "final_text": final_text,
+    }
+
+
+async def validate_node(state: TurnState, config: RunnableConfig) -> dict:
+    """THE permission-check boundary. Sits structurally between `decide` and
+    `act`: every tool call proposed by `decide` passes through here, and
+    `act` only ever dispatches to MCP for calls this node marked allowed."""
+    harness = _get_harness(config)
+    validated = []
+    for tc in state["pending_tool_calls"]:
+        allowed, category, parsed_args = harness._validate_and_check_permission(tc["name"], tc["arguments"])
+        reason = None if allowed else harness._reason_text(tc["name"], tc["arguments"], category)
+        if allowed:
+            print(f"[HARNESS] ALLOWED {tc['name']}({parsed_args})")
+        else:
+            print(f"[HARNESS] REJECTED ({category}) {tc['name']}({tc['arguments']}) -> {reason}")
+        validated.append({
+            "tool_call": tc, "allowed": allowed, "category": category,
+            "parsed_args": parsed_args, "reason": reason,
+        })
+    return {"validated_calls": validated}
+
+
+async def act_node(state: TurnState, config: RunnableConfig) -> dict:
+    """Dispatches to MCP -- but ONLY for calls `validate` already marked
+    allowed. A rejected call never reaches self.mcp_client.call_tool(...);
+    it gets a synthetic rejection tool_result instead, same as an allowed
+    call gets a real one, so the model always receives a response either way."""
+    harness = _get_harness(config)
+    new_messages = list(state["messages"])
+
+    for v in state["validated_calls"]:
+        tc = v["tool_call"]
+        if v["allowed"]:
+            harness.audit_log.append({
+                "tool": tc["name"], "args": v["parsed_args"], "decision": "allowed", "category": "allowed",
+            })
+            tool_result = await harness.mcp_client.call_tool(tc["name"], v["parsed_args"])
+            content = json.dumps(tool_result)
+        else:
+            harness.audit_log.append({
+                "tool": tc["name"], "args": tc["arguments"], "decision": "rejected",
+                "category": v["category"], "reason": v["reason"],
+            })
+            content = json.dumps({"error": "rejected_by_harness", "category": v["category"], "reason": v["reason"]})
+        new_messages.append({"role": "tool", "tool_call_id": tc["id"], "content": content})
+
+    return {
+        "messages": new_messages,
+        "iteration_count": state["iteration_count"] + 1,
+        "pending_tool_calls": [],
+        "validated_calls": [],
+    }
+
+
+async def respond_node(state: TurnState, config: RunnableConfig) -> dict:
+    """No-op if `decide` already produced a final answer. Only does real
+    work on the safety-valve path: MAX_TOOL_ITERATIONS was hit without the
+    model ever settling on a plain-text answer."""
+    if state.get("final_text") is not None:
+        return {}
+    print(f"[HARNESS] MAX_TOOL_ITERATIONS ({MAX_TOOL_ITERATIONS}) reached; escalating.")
+    fallback = (
+        "I wasn't able to finish resolving this in a bounded number of "
+        "tool calls, so I'm escalating this ticket to a human agent."
+    )
+    return {
+        "messages": state["messages"] + [{"role": "assistant", "content": fallback}],
+        "final_text": fallback,
+    }
+
+
+# --- Conditional edges ---------------------------------------------------
+
+def _route_after_decide(state: TurnState) -> str:
+    return "validate" if state["pending_tool_calls"] else "respond"
+
+
+def _route_after_act(state: TurnState) -> str:
+    return "respond" if state["iteration_count"] >= MAX_TOOL_ITERATIONS else "decide"
+
+
+@lru_cache(maxsize=1)
+def _compiled_graph():
+    """Built once per process (like _shared_retriever) -- the graph
+    structure is identical for every ticket; only the state passed to
+    ainvoke() differs per turn."""
+    graph = StateGraph(TurnState)
+    graph.add_node("classify", classify_node)
+    graph.add_node("retrieve", retrieve_node)
+    graph.add_node("memory", memory_node)
+    graph.add_node("decide", decide_node)
+    graph.add_node("validate", validate_node)
+    graph.add_node("act", act_node)
+    graph.add_node("respond", respond_node)
+
+    graph.add_edge(START, "classify")
+    graph.add_edge("classify", "retrieve")
+    graph.add_edge("retrieve", "memory")
+    graph.add_edge("memory", "decide")
+    graph.add_conditional_edges("decide", _route_after_decide, {"validate": "validate", "respond": "respond"})
+    graph.add_edge("validate", "act")
+    graph.add_conditional_edges("act", _route_after_act, {"decide": "decide", "respond": "respond"})
+    graph.add_edge("respond", END)
+
+    return graph.compile()
+
+
 class SupportHarness:
     def __init__(self, customer_id: str, provider: GroqProvider | None = None):
         accounts = json.loads((DATA_DIR / "accounts.json").read_text(encoding="utf-8"))
@@ -180,7 +439,7 @@ class SupportHarness:
             await self.mcp_client.__aexit__(*exc_info)
 
     def _validate_and_check_permission(self, tool_name: str, raw_args: dict) -> tuple[bool, str, dict | None]:
-        """The harness-enforced boundary. Runs before any MCP dispatch.
+        """The harness-enforced boundary, called from the `validate` node.
 
         Returns (allowed, category, parsed_args). category is one of
         "allowed", "unknown_tool", "malformed", "out_of_scope" -- kept
@@ -224,74 +483,22 @@ class SupportHarness:
         return "rejected"
 
     async def handle_turn(self, user_text: str) -> str:
-        self.short_term.add({"role": "user", "content": user_text})
-
-        ticket_type = classify_ticket(user_text)
-        hits = self.retriever.retrieve(user_text, top_k=2)
-        if hits:
-            policy_context = "\n\n".join(f"[{doc['id']}] {doc['text']}" for doc, _ in hits)
-            print(f"[RAG] retrieved: {[(doc['id'], score) for doc, score in hits]}")
-        else:
-            policy_context = "(No policy document in the knowledge base is relevant to this question.)"
-            print("[RAG] no relevant chunk found above threshold -- honest gap")
-
-        history_summary = self.long_term.get_history_summary(self.customer_id)
-        print(f"[MEMORY] long-term (customer_id={self.customer_id}): {history_summary}")
-        print(f"[MEMORY] short-term buffer size before this turn: {len(self.short_term.as_list()) - 1} messages")
-
-        system_msg = {
-            "role": "system",
-            "content": build_system_prompt(ticket_type, self.customer_id, policy_context, history_summary),
+        initial_state: TurnState = {
+            "messages": self.short_term.as_list() + [{"role": "user", "content": user_text}],
+            "customer_id": self.customer_id,
+            "ticket_type": "",
+            "policy_context": "",
+            "history_summary": "",
+            "pending_tool_calls": [],
+            "validated_calls": [],
+            "iteration_count": 0,
+            "final_text": None,
         }
-        print(f"[CLASSIFY] ticket_type={ticket_type}")
-
-        for _ in range(MAX_TOOL_ITERATIONS):
-            messages = [system_msg] + self.short_term.as_list()
-            result = self.provider.call(messages, tools=TOOLS)
-
-            if not result["tool_calls"]:
-                final_text = result["text"] or ""
-                self.short_term.add({"role": "assistant", "content": final_text})
-                return final_text
-
-            self.short_term.add({
-                "role": "assistant",
-                "content": result["text"],
-                "tool_calls": [
-                    {
-                        "id": tc["id"],
-                        "type": "function",
-                        "function": {"name": tc["name"], "arguments": json.dumps(tc["arguments"])},
-                    }
-                    for tc in result["tool_calls"]
-                ],
-            })
-
-            for tc in result["tool_calls"]:
-                allowed, category, parsed_args = self._validate_and_check_permission(tc["name"], tc["arguments"])
-                if not allowed:
-                    reason = self._reason_text(tc["name"], tc["arguments"], category)
-                    print(f"[HARNESS] REJECTED ({category}) {tc['name']}({tc['arguments']}) -> {reason}")
-                    self.audit_log.append({
-                        "tool": tc["name"], "args": tc["arguments"], "decision": "rejected",
-                        "category": category, "reason": reason,
-                    })
-                    content = json.dumps({"error": "rejected_by_harness", "category": category, "reason": reason})
-                else:
-                    print(f"[HARNESS] ALLOWED {tc['name']}({parsed_args})")
-                    self.audit_log.append({
-                        "tool": tc["name"], "args": parsed_args, "decision": "allowed", "category": "allowed",
-                    })
-                    tool_result = await self.mcp_client.call_tool(tc["name"], parsed_args)
-                    content = json.dumps(tool_result)
-                self.short_term.add({"role": "tool", "tool_call_id": tc["id"], "content": content})
-
-        # Hit the iteration cap without the model settling on a final answer --
-        # a safety valve, not something a well-behaved conversation should hit.
-        fallback = (
-            "I wasn't able to finish resolving this in a bounded number of "
-            "tool calls, so I'm escalating this ticket to a human agent."
+        final_state = await _compiled_graph().ainvoke(
+            initial_state,
+            config={"configurable": {"harness": self}, "recursion_limit": 100},
         )
-        print(f"[HARNESS] MAX_TOOL_ITERATIONS ({MAX_TOOL_ITERATIONS}) reached; escalating.")
-        self.short_term.add({"role": "assistant", "content": fallback})
-        return fallback
+        # Persist the whole turn (user message, any tool round trips, final
+        # answer) back into the conversation buffer for the next turn.
+        self.short_term.messages = final_state["messages"]
+        return final_state["final_text"] or ""

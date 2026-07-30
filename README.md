@@ -106,7 +106,7 @@ demo.py                    scripted run-through of every scenario, no typing nee
 requirements.txt           Python dependencies
 .env.example                template for the one required environment variable
 mcp_server/server.py       the MCP server -- exposes lookup_order and check_account_status
-agent/harness.py           the harness loop: classify -> retrieve -> decide -> validate/permission-check -> act -> respond
+agent/harness.py           the harness -- a LangGraph StateGraph: classify -> retrieve -> memory -> decide -> validate -> act -> respond
 agent/provider.py          Groq API wrapper (the only file that imports the groq SDK)
 agent/mcp_client.py        spawns mcp_server/server.py and talks to it over MCP (stdio)
 agent/rag.py               hybrid retriever: BM25 (lexical) + FAISS/sentence-transformers (semantic) over policies/
@@ -125,18 +125,37 @@ retrieves policy grounding).
 
 ## 6. Why I built the harness this way
 
-**The harness, not the model, decides.** `SupportHarness.handle_turn` in
-`agent/harness.py` sends every model-proposed tool call through
-`_validate_and_check_permission()` before any of them reach
-`agent/mcp_client.py`. A rejected call never touches the MCP layer at all --
-it gets a synthetic `tool_result` explaining why (with a machine-readable
-`category`), and the conversation continues. That's the one line to point to
-for grading: `agent/harness.py`, inside `handle_turn`, the `for tc in
-result["tool_calls"]:` loop, calling `self._validate_and_check_permission(...)`
-before `self.mcp_client.call_tool(...)`.
+**The harness, not the model, decides -- built as a LangGraph `StateGraph`.**
+`agent/harness.py` models the loop as graph nodes, not a hand-rolled
+while-loop:
+
+```
+classify -> retrieve -> memory -> decide --(conditional edge)--> validate -> act --(conditional edge)--> decide (loop)
+                                       \                                                              \
+                                        --(no tool calls)--> respond -> END        (iteration cap hit)--> respond -> END
+```
+
+`decide` is the *only* node that talks to the LLM (via `GroqProvider`) and
+it only ever *proposes* tool calls -- it never decides whether they run.
+That decision belongs to `validate`, a completely separate node that sits on
+every path from `decide` to `act`. LangGraph's conditional-edge routing
+functions (`add_conditional_edges`) can choose the next node based on state,
+but can't themselves produce state updates -- so the actual permission-check
+*logic* has to live in a node, not the router callback. `validate` is that
+node: every proposed call passes through it, and `act` (the only node that
+touches `agent/mcp_client.py`) only ever dispatches to MCP for a call
+`validate` already marked allowed. A rejected call never reaches
+`self.mcp_client.call_tool(...)` at all -- `act` still runs (it has to feed
+a rejection `tool_result` back to the model either way), but for a rejected
+call it synthesizes the rejection itself instead of calling MCP. That's the
+line to point to for grading: `agent/harness.py`, `validate_node`, calling
+`harness._validate_and_check_permission(...)`, and `act_node`'s `if
+v["allowed"]:` branch guarding the one and only call to
+`harness.mcp_client.call_tool(...)`.
 
 **Validation and security, layered, in the order a call actually passes
-through** (see `_validate_and_check_permission`):
+through** (see `SupportHarness._validate_and_check_permission`, called from
+`validate_node`):
 1. **Tool allowlist** -- the name must be one of the two registered tools;
    anything else is `unknown_tool`, rejected immediately.
 2. **Schema/shape validation** -- a pydantic model per tool
@@ -153,7 +172,8 @@ through** (see `_validate_and_check_permission`):
    loaded directly by the harness (not fetched through the tool).
 
 Every decision is appended to `self.audit_log` (tool, args, allowed/rejected,
-category, reason), and a `MAX_TOOL_ITERATIONS` cap (6) stops a
+category, reason), and a `MAX_TOOL_ITERATIONS` cap (6), enforced by the
+conditional edge after `act` (`_route_after_act`), stops a
 misbehaving/adversarial model from looping tool calls indefinitely in one
 turn -- a bounded-resources safety valve, not something a normal
 conversation should ever hit.
