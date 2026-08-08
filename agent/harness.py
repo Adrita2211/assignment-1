@@ -51,7 +51,9 @@ misbehaving or adversarial model from looping tool calls indefinitely --
 enforced by the conditional edge after `act`.
 """
 import json
+import os
 import re
+import time
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional, TypedDict
@@ -65,9 +67,21 @@ from agent.memory import LongTermMemory, ShortTermMemory
 from agent.mcp_client import MCPToolClient
 from agent.provider import GroqProvider
 from agent.rag import HybridPolicyRetriever
+from agent.tracing import langfuse, observe
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 MAX_TOOL_ITERATIONS = 6
+
+# The one deliberate defect used for the CI regression-gate demo (see
+# eval/trajectory_eval.py and the README's "before/after" section): when
+# true, retrieve_node stops returning any policy hit, even for a question a
+# real policy doc clearly covers. This mirrors agent-cicd-demo's
+# AGENT_REGRESSED pattern (which removes a whole tool) but applies to the
+# grounding step instead of a tool call, since this agent's RAG retrieval
+# isn't itself a model-invoked tool -- it runs automatically before `decide`.
+# Toggled via an env var, not a code branch, so the regressed commit for the
+# demo is a one-line diff, same discipline as agent-cicd-demo's tools_schema.py.
+AGENT_REGRESSED = os.environ.get("AGENT_REGRESSED", "false").lower() == "true"
 
 _ORDER_ID_RE = re.compile(r"^ORD\d+$")
 _CUSTOMER_ID_RE = re.compile(r"^CUST\d+$")
@@ -166,13 +180,26 @@ def build_system_prompt(ticket_type: str, customer_id: str, policy_context: str,
     )
 
 
+POLICY_DIR = Path(__file__).resolve().parent.parent / "policies"
+
+
 @lru_cache(maxsize=1)
-def _shared_retriever() -> HybridPolicyRetriever:
-    """The policy corpus never changes between tickets, so build the BM25
-    index and load the embedding model exactly once per process and reuse it
+def _shared_retriever():
+    """The policy corpus never changes between tickets, so build the index
+    and load the embedding model exactly once per process and reuse it
     across every SupportHarness session, instead of paying that startup cost
-    (most visibly, reloading the embedding model) on every single ticket."""
-    return HybridPolicyRetriever(Path(__file__).resolve().parent.parent / "policies")
+    (most visibly, reloading the embedding model) on every single ticket.
+
+    Backend selection: DATABASE_URL set -> RDS PostgreSQL + pgvector
+    (agent/rag_pgvector.py), the required backend for the deployed agent
+    (see README's AWS architecture section). Unset -> the local FAISS+BM25
+    index (agent/rag.py), which keeps demo.py/main.py runnable with zero
+    external services for local development."""
+    database_url = os.environ.get("DATABASE_URL")
+    if database_url:
+        from agent.rag_pgvector import PgVectorPolicyRetriever
+        return PgVectorPolicyRetriever(database_url, POLICY_DIR)
+    return HybridPolicyRetriever(POLICY_DIR)
 
 
 # --- Graph state ------------------------------------------------------------
@@ -189,6 +216,7 @@ class TurnState(TypedDict):
     ticket_type: str
     policy_context: str
     history_summary: str
+    retrieved_doc_ids: list[str]      # policy doc ids actually retrieved this turn (trajectory eval)
     pending_tool_calls: list[dict]    # tool calls proposed by the last `decide` call
     validated_calls: list[dict]       # `validate`'s output: allow/reject decision per call
     iteration_count: int
@@ -225,12 +253,18 @@ def _retrieval_query(messages: list[dict]) -> str:
 
 # --- Nodes -------------------------------------------------------------------
 
+@observe(as_type="span", name="classify_ticket")
 async def classify_node(state: TurnState, config: RunnableConfig) -> dict:
     ticket_type = classify_ticket(_latest_user_text(state["messages"]))
     print(f"[CLASSIFY] ticket_type={ticket_type}")
+    langfuse.update_current_span(
+        input={"message": _latest_user_text(state["messages"])},
+        output={"ticket_type": ticket_type},
+    )
     return {"ticket_type": ticket_type}
 
 
+@observe(as_type="retriever", name="retrieve_policy")
 async def retrieve_node(state: TurnState, config: RunnableConfig) -> dict:
     """Try the current message alone first -- that's the strongest, least
     noisy signal, and is what every accuracy test was tuned against. Only
@@ -240,7 +274,23 @@ async def retrieve_node(state: TurnState, config: RunnableConfig) -> dict:
     escalation reply full of unrelated words) can outweigh and misrank a
     perfectly well-formed new question that would have retrieved correctly
     on its own."""
+    langfuse.update_current_span(input={"query": _latest_user_text(state["messages"])})
     harness = _get_harness(config)
+
+    if harness.regressed:
+        # The deliberate defect: retrieval is silently disabled, as if the
+        # index were empty, regardless of what a real policy doc would have
+        # matched. Nothing else about the agent changes -- decide_node still
+        # runs, the model still answers -- so a naive final-answer-only check
+        # can be fooled if the model fills the gap with plausible-sounding
+        # but ungrounded prior knowledge instead of admitting the gap.
+        print("[RAG] retrieval disabled (AGENT_REGRESSED=true) -- simulating a broken grounding step")
+        langfuse.update_current_span(output={"retrieved_doc_ids": [], "regressed": True})
+        return {
+            "policy_context": "(No policy document in the knowledge base is relevant to this question.)",
+            "retrieved_doc_ids": [],
+        }
+
     current_text = _latest_user_text(state["messages"])
     hits = harness.retriever.retrieve(current_text, top_k=2)
     used_context = False
@@ -254,11 +304,14 @@ async def retrieve_node(state: TurnState, config: RunnableConfig) -> dict:
     if hits:
         policy_context = "\n\n".join(f"[{doc['id']}] {doc['text']}" for doc, _ in hits)
         tag = " (via conversation context fallback)" if used_context else ""
+        doc_ids = [doc["id"] for doc, _ in hits]
         print(f"[RAG] retrieved{tag}: {[(doc['id'], score) for doc, score in hits]}")
     else:
         policy_context = "(No policy document in the knowledge base is relevant to this question.)"
+        doc_ids = []
         print("[RAG] no relevant chunk found above threshold -- honest gap")
-    return {"policy_context": policy_context}
+    langfuse.update_current_span(output={"retrieved_doc_ids": doc_ids})
+    return {"policy_context": policy_context, "retrieved_doc_ids": doc_ids}
 
 
 async def memory_node(state: TurnState, config: RunnableConfig) -> dict:
@@ -269,6 +322,7 @@ async def memory_node(state: TurnState, config: RunnableConfig) -> dict:
     return {"history_summary": history_summary}
 
 
+@observe(as_type="generation", name="decide")
 async def decide_node(state: TurnState, config: RunnableConfig) -> dict:
     """The only node that talks to the LLM. It proposes tool calls; it does
     NOT decide whether they're allowed to run -- that's `validate`'s job."""
@@ -279,7 +333,27 @@ async def decide_node(state: TurnState, config: RunnableConfig) -> dict:
             state["ticket_type"], state["customer_id"], state["policy_context"], state["history_summary"]
         ),
     }
-    result = harness.provider.call([system_msg] + state["messages"], tools=TOOLS)
+    # System-observability-layer capture (latency, tokens, error rate) --
+    # timed and recorded here, the one place every LLM call in a turn passes
+    # through, rather than estimated after the fact from trace timestamps.
+    t0 = time.perf_counter()
+    try:
+        result = harness.provider.call([system_msg] + state["messages"], tools=TOOLS)
+    except Exception as exc:
+        harness.metrics_log.append({"latency_s": time.perf_counter() - t0, "error": str(exc)})
+        raise
+    harness.metrics_log.append({
+        "latency_s": time.perf_counter() - t0,
+        "input_tokens": result.get("usage", {}).get("input_tokens", 0),
+        "output_tokens": result.get("usage", {}).get("output_tokens", 0),
+        "error": None,
+    })
+    langfuse.update_current_generation(
+        input=state["messages"],
+        output={"text": result["text"], "tool_calls": [tc["name"] for tc in result["tool_calls"]]},
+        model=harness.provider.model,
+        usage_details=result.get("usage"),
+    )
 
     if result["tool_calls"]:
         assistant_msg = {
@@ -327,6 +401,22 @@ async def validate_node(state: TurnState, config: RunnableConfig) -> dict:
     return {"validated_calls": validated}
 
 
+@observe(as_type="tool", name="lookup_order")
+async def _traced_lookup_order(mcp_client: MCPToolClient, order_id: str) -> dict:
+    return await mcp_client.call_tool("lookup_order", {"order_id": order_id})
+
+
+@observe(as_type="tool", name="check_account_status")
+async def _traced_check_account_status(mcp_client: MCPToolClient, customer_id: str) -> dict:
+    return await mcp_client.call_tool("check_account_status", {"customer_id": customer_id})
+
+
+_TRACED_TOOL_CALLS = {
+    "lookup_order": lambda mcp_client, args: _traced_lookup_order(mcp_client, args["order_id"]),
+    "check_account_status": lambda mcp_client, args: _traced_check_account_status(mcp_client, args["customer_id"]),
+}
+
+
 async def act_node(state: TurnState, config: RunnableConfig) -> dict:
     """Dispatches to MCP -- but ONLY for calls `validate` already marked
     allowed. A rejected call never reaches self.mcp_client.call_tool(...);
@@ -341,7 +431,8 @@ async def act_node(state: TurnState, config: RunnableConfig) -> dict:
             harness.audit_log.append({
                 "tool": tc["name"], "args": v["parsed_args"], "decision": "allowed", "category": "allowed",
             })
-            tool_result = await harness.mcp_client.call_tool(tc["name"], v["parsed_args"])
+            traced_call = _TRACED_TOOL_CALLS[tc["name"]]
+            tool_result = await traced_call(harness.mcp_client, v["parsed_args"])
             content = json.dumps(tool_result)
         else:
             harness.audit_log.append({
@@ -413,7 +504,7 @@ def _compiled_graph():
 
 
 class SupportHarness:
-    def __init__(self, customer_id: str, provider: GroqProvider | None = None):
+    def __init__(self, customer_id: str, provider: GroqProvider | None = None, regressed: bool | None = None):
         accounts = json.loads((DATA_DIR / "accounts.json").read_text(encoding="utf-8"))
         if customer_id not in accounts:
             raise ValueError(f"Unknown customer_id {customer_id!r}; cannot open a session for it.")
@@ -424,6 +515,16 @@ class SupportHarness:
         self.long_term = LongTermMemory(DATA_DIR / "ticket_history.json")
         self.short_term = ShortTermMemory()
         self.audit_log: list[dict] = []
+        self.metrics_log: list[dict] = []  # one entry per LLM call this turn -- see metrics()
+        self.last_trace_id: Optional[str] = None
+        self.last_retrieved_doc_ids: list[str] = []
+        # Per-instance, not a process-wide constant, so a single process (a
+        # test harness, eval/before_after_report.py) can run both the clean
+        # and regressed variants side by side without env-var/reload games.
+        # Defaults to the AGENT_REGRESSED env var, which is how the real
+        # deployed build and the CI gate select it (a one-line Dockerfile
+        # ENV / task-definition env value, per agent-cicd-demo's pattern).
+        self.regressed = AGENT_REGRESSED if regressed is None else regressed
         self._orders_index = {
             oid: order["customer_id"]
             for oid, order in json.loads((DATA_DIR / "orders.json").read_text(encoding="utf-8")).items()
@@ -482,13 +583,18 @@ class SupportHarness:
             )
         return "rejected"
 
+    @observe(as_type="agent", name="handle_turn")
     async def handle_turn(self, user_text: str) -> str:
+        langfuse.update_current_span(input={"customer_id": self.customer_id, "message": user_text})
+        self.last_trace_id = langfuse.get_current_trace_id()
+
         initial_state: TurnState = {
             "messages": self.short_term.as_list() + [{"role": "user", "content": user_text}],
             "customer_id": self.customer_id,
             "ticket_type": "",
             "policy_context": "",
             "history_summary": "",
+            "retrieved_doc_ids": [],
             "pending_tool_calls": [],
             "validated_calls": [],
             "iteration_count": 0,
@@ -501,4 +607,43 @@ class SupportHarness:
         # Persist the whole turn (user message, any tool round trips, final
         # answer) back into the conversation buffer for the next turn.
         self.short_term.messages = final_state["messages"]
-        return final_state["final_text"] or ""
+        final_text = final_state["final_text"] or ""
+        self.last_retrieved_doc_ids = final_state.get("retrieved_doc_ids", [])
+
+        langfuse.update_current_span(
+            output={"response": final_text, "trajectory": self.trajectory()},
+        )
+        return final_text
+
+    def trajectory(self) -> list[str]:
+        """The ordered set of grounding/tool steps this turn actually took,
+        in the same vocabulary eval/trajectory_eval.py's fixtures use:
+        "retrieve_policy" (a non-empty RAG hit on the most recent turn) plus
+        whichever of lookup_order / check_account_status were actually
+        dispatched to MCP (allowed calls only -- a rejected call never
+        reached MCP, so it must not count as evidence the step "happened").
+        This is what a trajectory check scores, not the final answer text."""
+        steps = [entry["tool"] for entry in self.audit_log if entry["decision"] == "allowed"]
+        if self.last_retrieved_doc_ids:
+            steps.append("retrieve_policy")
+        return steps
+
+    def metrics(self) -> dict:
+        """System-observability-layer summary for this session so far:
+        latency, token cost, and error rate across every LLM call
+        decide_node made -- the signals eval/report.py's System layer and
+        eval/longitudinal_eval.py's cross-run aggregation both read. Built
+        from self.metrics_log (populated by decide_node), not re-derived
+        from LangFuse, so it works identically with tracing disabled."""
+        calls = self.metrics_log
+        errors = [c for c in calls if c.get("error")]
+        latencies = [c["latency_s"] for c in calls]
+        return {
+            "llm_calls": len(calls),
+            "total_latency_s": round(sum(latencies), 3),
+            "avg_latency_s": round(sum(latencies) / len(latencies), 3) if latencies else 0.0,
+            "total_input_tokens": sum(c.get("input_tokens", 0) for c in calls),
+            "total_output_tokens": sum(c.get("output_tokens", 0) for c in calls),
+            "error_count": len(errors),
+            "error_rate": round(len(errors) / len(calls), 3) if calls else 0.0,
+        }

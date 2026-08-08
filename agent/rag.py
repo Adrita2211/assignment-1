@@ -120,37 +120,43 @@ class _VectorIndex:
         self._model = None
         self._index = None
         self._np = None
-        try:
-            import faiss
-            import numpy as np
-            from sentence_transformers import SentenceTransformer
-
-            self._np = np
-            try:
-                # Once the model is cached locally (true after the first
-                # run), load straight from disk -- no Hub network call, no
-                # "unauthenticated requests" warning, and faster startup.
-                self._model = SentenceTransformer(_EMBED_MODEL_NAME, local_files_only=True)
-            except Exception:
-                # Not cached yet (genuinely first run on this machine) --
-                # fall through to a normal load, which downloads it once.
-                self._model = SentenceTransformer(_EMBED_MODEL_NAME)
-            doc_vecs = self._model.encode([d["text"] for d in docs], normalize_embeddings=True)
-            doc_vecs = np.asarray(doc_vecs, dtype="float32")
-
-            # IndexFlatIP = exact (brute-force) inner-product search. With
-            # L2-normalized vectors, inner product == cosine similarity.
-            # Exact, not approximate, is the right call at this corpus size
-            # (a handful of docs) -- an ANN index (IVF/HNSW) only starts
-            # paying off at thousands+ vectors.
-            self._index = faiss.IndexFlatIP(doc_vecs.shape[1])
-            self._index.add(doc_vecs)
-            self.available = True
-        except Exception as exc:  # missing package, no network, corrupt cache, etc.
-            print(
-                f"[RAG] vector backend unavailable ({type(exc).__name__}: {exc}) "
-                "-- falling back to BM25-only retrieval."
-            )
+        # Temporarily disabled: local sentence-transformers load is what
+        # produces the slow "Loading weights" startup step. We're moving
+        # the vector signal to pgvector next, so skip local FAISS/ST setup
+        # for now and fall back to BM25-only. Restore this block (or swap
+        # it for a pgvector-backed lookup) once that migration lands.
+        # try:
+        #     import faiss
+        #     import numpy as np
+        #     from sentence_transformers import SentenceTransformer
+        #
+        #     self._np = np
+        #     try:
+        #         # Once the model is cached locally (true after the first
+        #         # run), load straight from disk -- no Hub network call, no
+        #         # "unauthenticated requests" warning, and faster startup.
+        #         self._model = SentenceTransformer(_EMBED_MODEL_NAME, local_files_only=True)
+        #     except Exception:
+        #         # Not cached yet (genuinely first run on this machine) --
+        #         # fall through to a normal load, which downloads it once.
+        #         self._model = SentenceTransformer(_EMBED_MODEL_NAME)
+        #     doc_vecs = self._model.encode([d["text"] for d in docs], normalize_embeddings=True)
+        #     doc_vecs = np.asarray(doc_vecs, dtype="float32")
+        #
+        #     # IndexFlatIP = exact (brute-force) inner-product search. With
+        #     # L2-normalized vectors, inner product == cosine similarity.
+        #     # Exact, not approximate, is the right call at this corpus size
+        #     # (a handful of docs) -- an ANN index (IVF/HNSW) only starts
+        #     # paying off at thousands+ vectors.
+        #     self._index = faiss.IndexFlatIP(doc_vecs.shape[1])
+        #     self._index.add(doc_vecs)
+        #     self.available = True
+        # except Exception as exc:  # missing package, no network, corrupt cache, etc.
+        #     print(
+        #         f"[RAG] vector backend unavailable ({type(exc).__name__}: {exc}) "
+        #         "-- falling back to BM25-only retrieval."
+        #     )
+        print("[RAG] vector backend disabled (pending pgvector migration) -- using BM25-only retrieval.")
 
     def scores(self, query: str) -> list[float]:
         if not self.available:
