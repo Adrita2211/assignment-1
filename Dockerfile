@@ -9,7 +9,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# torch is a sentence-transformers dependency; PyPI's default wheel bundles
+# full CUDA/GPU libraries (500MB+) this ECS task never uses. Installing the
+# CPU-only build from PyTorch's own index first (~150-200MB) satisfies that
+# dependency before requirements.txt's normal install would otherwise pull
+# the much larger GPU wheel.
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
+    && pip install --no-cache-dir -r requirements.txt
 
 COPY agent/ agent/
 COPY mcp_server/ mcp_server/
