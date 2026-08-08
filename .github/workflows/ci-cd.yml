@@ -44,6 +44,9 @@ jobs:
       - name: Generate full evaluation report
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          LANGFUSE_HOST: ${{ secrets.LANGFUSE_HOST }}
+          LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
         run: python -m eval.report
       - uses: actions/upload-artifact@v4
         with:
@@ -61,6 +64,9 @@ jobs:
       - name: Run trajectory-eval regression gate
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          LANGFUSE_HOST: ${{ secrets.LANGFUSE_HOST }}
+          LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
           # AGENT_REGRESSED is intentionally NOT set here -- the eval-gate
           # job always evaluates the agent as the branch actually built it.
           # On the regression-demo branch that means the harness's own
