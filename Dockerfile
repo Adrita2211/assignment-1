@@ -14,8 +14,19 @@ COPY requirements.txt .
 # CPU-only build from PyTorch's own index first (~150-200MB) satisfies that
 # dependency before requirements.txt's normal install would otherwise pull
 # the much larger GPU wheel.
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
-    && pip install --no-cache-dir -r requirements.txt
+#
+# --timeout/--retries: a large multi-hundred-MB install is long enough that
+# a single transient read timeout on one package (observed in practice on
+# this build) would otherwise kill the whole layer -- pip's own defaults
+# (15s timeout, no retry on read timeouts mid-download) are too impatient
+# for that.
+#
+# Split into two RUN layers (not chained with &&) so a successful torch
+# install is cached independently -- a retry after a later package's
+# transient failure resumes from the cached torch layer instead of
+# re-downloading it from scratch.
+RUN pip install --no-cache-dir --timeout 120 --retries 10 torch --index-url https://download.pytorch.org/whl/cpu
+RUN pip install --no-cache-dir --timeout 120 --retries 10 -r requirements.txt
 
 COPY agent/ agent/
 COPY mcp_server/ mcp_server/
