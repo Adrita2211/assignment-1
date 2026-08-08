@@ -2,9 +2,9 @@ FROM python:3.11-slim
 
 WORKDIR /srv
 
-# Build tools only needed to compile faiss-cpu/sentence-transformers deps on
-# some platforms; removed from the final layer via --no-install-recommends
-# plus apt cleanup to keep the image lean.
+# Build tools only needed to compile sentence-transformers' deps (e.g.
+# torch) on some platforms; removed from the final layer via
+# --no-install-recommends plus apt cleanup to keep the image lean.
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
     && rm -rf /var/lib/apt/lists/*
 
