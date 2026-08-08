@@ -10,3 +10,5 @@ __pycache__/
 task-definition.json
 eval/run_history.jsonl
 eval/report_output.md
+
+.rds_master_password.tmp

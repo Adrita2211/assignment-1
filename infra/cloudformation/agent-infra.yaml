@@ -1,25 +1,29 @@
+# ecommerce-support-agent core infra: ECR, ECS cluster/service (Fargate)
+# with Service Auto Scaling, an ALB, RDS PostgreSQL + pgvector (the
+# locked-in vector store for this assignment -- replaces Assignment 1's
+# local FAISS index), and the two IAM roles (GitHub OIDC deploy role + ECS
+# task execution role). Adapted directly from agent-cicd-demo's own
+# agent-infra.yaml, per the assignment's own guidance to reuse that shape
+# rather than redesign it.
+#
+# The GitHub OIDC provider itself is account-wide and intentionally NOT
+# managed here -- other repos may depend on it, so it's created once via a
+# tiny separate script (infra/setup_oidc_provider.sh) and passed in as a
+# parameter.
+#
+# Deliberate boundary: this stack owns the INFRASTRUCTURE. GitHub Actions
+# owns WHICH IMAGE IS RUNNING -- every push registers a new task definition
+# revision and calls ecs:UpdateService directly, outside this stack. The
+# ContainerImage parameter only seeds the initial task definition; the
+# deploy wrapper script re-passes the currently-running image on every
+# subsequent `cloudformation deploy` so an unrelated infra change (e.g. a
+# security group rule) can never accidentally roll the service back to the
+# bootstrap placeholder image.
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  ecommerce-support-agent core infra: ECR, ECS cluster/service (Fargate) with
-  Service Auto Scaling, an ALB, RDS PostgreSQL + pgvector (the locked-in
-  vector store for this assignment -- replaces Assignment 1's local FAISS
-  index), and the two IAM roles (GitHub OIDC deploy role + ECS task execution
-  role). Adapted directly from agent-cicd-demo's own agent-infra.yaml, per
-  the assignment's own guidance to reuse that shape rather than redesign it.
-
-  The GitHub OIDC provider itself is account-wide and intentionally NOT
-  managed here -- other repos may depend on it, so it's created once via a
-  tiny separate script (infra/setup_oidc_provider.sh) and passed in as a
-  parameter.
-
-  Deliberate boundary: this stack owns the INFRASTRUCTURE. GitHub Actions
-  owns WHICH IMAGE IS RUNNING -- every push registers a new task definition
-  revision and calls ecs:UpdateService directly, outside this stack. The
-  ContainerImage parameter only seeds the initial task definition; the
-  deploy wrapper script re-passes the currently-running image on every
-  subsequent `cloudformation deploy` so an unrelated infra change (e.g. a
-  security group rule) can never accidentally roll the service back to the
-  bootstrap placeholder image.
+  ecommerce-support-agent core infra: ECR, ECS Fargate + Service Auto
+  Scaling, an ALB, RDS PostgreSQL + pgvector, and the GitHub OIDC deploy
+  role + ECS task execution role. See inline comments for full rationale.
 
 Parameters:
   AppName:

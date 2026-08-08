@@ -18,7 +18,9 @@ APP_NAME="${APP_NAME:-ecommerce-support-agent}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-t3.large}"
 STACK_NAME="${APP_NAME}-langfuse"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# See deploy_agent_stack.sh's comment on this same line -- pwd -W keeps
+# --template-file in the Windows-path form aws.exe needs under Git Bash.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && { pwd -W 2>/dev/null || pwd; })"
 
 echo "Region: $AWS_REGION   Instance type: $INSTANCE_TYPE"
 

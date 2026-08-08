@@ -34,7 +34,13 @@ MAX_TASK_COUNT="${MAX_TASK_COUNT:-4}"
 AUTOSCALING_CPU_TARGET="${AUTOSCALING_CPU_TARGET:-60}"
 STACK_NAME="${APP_NAME}-infra"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# pwd -W (Git Bash on Windows) yields a Windows-style path (D:/...) rather
+# than a POSIX one (/d/...) -- aws.exe is a native Windows binary and needs
+# --template-file in that form regardless of MSYS_NO_PATHCONV, which this
+# script's SSM parameter names (leading "/", easily mistaken for a POSIX
+# path and mangled by MSYS's auto path-conversion) also require set to
+# avoid the opposite problem. Falls back to plain pwd off Windows.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && { pwd -W 2>/dev/null || pwd; })"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 
 echo "Account: $ACCOUNT_ID   Region: $AWS_REGION   App: $APP_NAME"
