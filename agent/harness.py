@@ -81,7 +81,7 @@ MAX_TOOL_ITERATIONS = 6
 # isn't itself a model-invoked tool -- it runs automatically before `decide`.
 # Toggled via an env var, not a code branch, so the regressed commit for the
 # demo is a one-line diff, same discipline as agent-cicd-demo's tools_schema.py.
-AGENT_REGRESSED = os.environ.get("AGENT_REGRESSED", "false").lower() == "true"
+AGENT_REGRESSED = os.environ.get("AGENT_REGRESSED", "true").lower() == "true"
 
 _ORDER_ID_RE = re.compile(r"^ORD\d+$")
 _CUSTOMER_ID_RE = re.compile(r"^CUST\d+$")
