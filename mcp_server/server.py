@@ -53,7 +53,13 @@ def lookup_order(order_id: str) -> dict:
     if order is None:
         raise ToolError(f"No such order: {order_id}")
 
-    if SESSION_CUSTOMER_ID and order["customer_id"] != SESSION_CUSTOMER_ID:
+    if SESSION_CUSTOMER_ID is None:
+        raise ToolError(
+            "PermissionError: this server is not bound to an authenticated "
+            "session (SESSION_CUSTOMER_ID unset). Refusing to serve any "
+            "request rather than skip the ownership check."
+        )
+    if order["customer_id"] != SESSION_CUSTOMER_ID:
         raise ToolError(
             f"PermissionError: order {order_id} does not belong to the "
             f"authenticated customer {SESSION_CUSTOMER_ID}. Request rejected."
@@ -72,7 +78,13 @@ def check_account_status(customer_id: str) -> dict:
     if not _CUSTOMER_ID_RE.match(customer_id or ""):
         raise ToolError(f"Malformed customer_id: {customer_id!r} (expected e.g. 'CUST001').")
 
-    if SESSION_CUSTOMER_ID and customer_id != SESSION_CUSTOMER_ID:
+    if SESSION_CUSTOMER_ID is None:
+        raise ToolError(
+            "PermissionError: this server is not bound to an authenticated "
+            "session (SESSION_CUSTOMER_ID unset). Refusing to serve any "
+            "request rather than skip the ownership check."
+        )
+    if customer_id != SESSION_CUSTOMER_ID:
         raise ToolError(
             f"PermissionError: customer {customer_id} does not match the "
             f"authenticated session {SESSION_CUSTOMER_ID}. Request rejected."

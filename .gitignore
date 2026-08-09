@@ -2,3 +2,13 @@
 __pycache__/
 *.pyc
 .env
+.env.local
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+task-definition.json
+eval/run_history.jsonl
+eval/report_output.md
+
+.rds_master_password.tmp

@@ -1,0 +1,138 @@
+name: eval-gate-and-deploy
+
+# Same shape as agent-cicd-demo's ci-cd.yml, reused directly per the
+# assignment's §7.5 guidance: eval-gate -> build-and-push -> deploy. Nothing
+# downstream of eval-gate runs unless eval/trajectory_eval.py's real
+# regression check (against eval/baseline.json) holds up -- that script
+# decides pass/fail via its own exit code, this file doesn't duplicate that
+# logic in YAML.
+
+on:
+  push:
+    branches: ["main", "regression-demo"]
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write   # required for aws-actions/configure-aws-credentials OIDC
+  contents: read
+
+env:
+  APP_NAME: ecommerce-support-agent
+  ECS_CLUSTER: ecommerce-support-agent-cluster
+  ECS_SERVICE: ecommerce-support-agent-service
+  ECS_TASK_FAMILY: ecommerce-support-agent-task
+  CONTAINER_NAME: ecommerce-support-agent
+
+jobs:
+  # Non-blocking, manually-triggered only (never runs on a push, never gates
+  # build-and-push/deploy). Generates eval/report_output.md -- the full
+  # Taxonomy Axis 4 report (task success, groundedness, policy adherence,
+  # safety, robustness, calibration) plus the System layer -- as a downloadable
+  # artifact. Deliberately separate from eval-gate: the CI gate's job is to
+  # block a regressed deploy fast using one cheap, deterministic check
+  # (trajectory); this job is slow, judge-heavy, and exists for evidence and
+  # review, not to sit on the deploy critical path.
+  full-eval-report:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Generate full evaluation report
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          LANGFUSE_HOST: ${{ secrets.LANGFUSE_HOST }}
+          LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+        run: python -m eval.report
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: eval/report_output.md
+
+  eval-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Run trajectory-eval regression gate
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          LANGFUSE_HOST: ${{ secrets.LANGFUSE_HOST }}
+          LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+          # AGENT_REGRESSED is intentionally NOT set here -- the eval-gate
+          # job always evaluates the agent as the branch actually built it.
+          # On the regression-demo branch that means the harness's own
+          # regressed default (baked into agent/harness.py / the Dockerfile
+          # ENV for that branch) is what gets scored, exactly like a real
+          # commit-level defect would be.
+        run: python -m eval.trajectory_eval
+
+  build-and-push:
+    needs: eval-gate
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.build.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC, no static keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        id: build
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: |
+          IMAGE="$ECR_REGISTRY/${{ env.APP_NAME }}:${{ github.sha }}"
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC, no static keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Fetch current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.ECS_TASK_FAMILY }} \
+            --query taskDefinition > task-definition.json
+
+      - name: Render new image into task definition
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ needs.build-and-push.outputs.image }}
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
