@@ -46,6 +46,7 @@ from pathlib import Path
 from agent.harness import SupportHarness
 from agent.provider import GroqProvider
 from eval.fixtures import TICKETS
+from eval.langfuse_scores import push_score
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 POLICY_DIR = Path(__file__).resolve().parent.parent / "policies"
@@ -126,19 +127,34 @@ def judge_response(provider: GroqProvider, ticket: dict, response_text: str) -> 
 async def run_ticket(ticket: dict, judge_provider: GroqProvider, n_runs: int) -> dict:
     async with SupportHarness(ticket["customer_id"]) as harness:
         response = await harness.handle_turn(ticket["message"])
+        trace_id = harness.last_trace_id
 
     scores = [judge_response(judge_provider, ticket, response) for _ in range(n_runs)]
     groundedness_scores = [s["groundedness"] for s in scores]
     task_success_scores = [s["task_success"] for s in scores]
+    groundedness_mean = round(statistics.fmean(groundedness_scores), 2)
+    groundedness_stdev = round(statistics.pstdev(groundedness_scores), 2) if len(groundedness_scores) > 1 else 0.0
+    task_success_mean = round(statistics.fmean(task_success_scores), 2)
+    task_success_stdev = round(statistics.pstdev(task_success_scores), 2) if len(task_success_scores) > 1 else 0.0
+
+    push_score(
+        trace_id, "groundedness", groundedness_mean, data_type="NUMERIC",
+        comment=f"runs={groundedness_scores} stdev={groundedness_stdev} (0-10, fact-checked against reference)",
+    )
+    push_score(
+        trace_id, "task_success", task_success_mean, data_type="NUMERIC",
+        comment=f"runs={task_success_scores} stdev={task_success_stdev} (0-10, independent of groundedness)",
+    )
+
     return {
         "id": ticket["id"],
         "response": response,
         "groundedness_scores": groundedness_scores,
-        "groundedness_mean": round(statistics.fmean(groundedness_scores), 2),
-        "groundedness_stdev": round(statistics.pstdev(groundedness_scores), 2) if len(groundedness_scores) > 1 else 0.0,
+        "groundedness_mean": groundedness_mean,
+        "groundedness_stdev": groundedness_stdev,
         "task_success_scores": task_success_scores,
-        "task_success_mean": round(statistics.fmean(task_success_scores), 2),
-        "task_success_stdev": round(statistics.pstdev(task_success_scores), 2) if len(task_success_scores) > 1 else 0.0,
+        "task_success_mean": task_success_mean,
+        "task_success_stdev": task_success_stdev,
     }
 
 
