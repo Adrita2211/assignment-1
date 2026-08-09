@@ -59,7 +59,9 @@ for name in LANGFUSE_HOST LANGFUSE_PUBLIC_KEY LANGFUSE_SECRET_KEY; do
     aws ssm put-parameter --name "/${APP_NAME}/${name}" --value "unset" --type SecureString \
       --region "$AWS_REGION" >/dev/null
 done
-echo "SSM placeholders ready for any LANGFUSE_* parameter not yet set (real values come from infra/deploy_langfuse_stack.sh)"
+echo "SSM placeholders ready for any LANGFUSE_* parameter not yet set -- overwrite with your real"
+echo "LangFuse Cloud (or self-hosted) credentials via 'aws ssm put-parameter ... --overwrite',"
+echo "then 'aws ecs update-service ... --force-new-deployment' to pick them up (see README section 7)."
 
 VPC_ID=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --region "$AWS_REGION" --query "Vpcs[0].VpcId" --output text)
 SUBNET_IDS=$(aws ec2 describe-subnets --filters Name=vpc-id,Values="$VPC_ID" --region "$AWS_REGION" --query "Subnets[].SubnetId" --output text | tr '\t' ',')

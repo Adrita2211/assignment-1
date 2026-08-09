@@ -122,7 +122,7 @@ eval/trajectory_eval.py    the CI regression gate (section 9)
 eval/llm_judge.py          LLM-as-judge groundedness scorer (section 8)
 eval/before_after_report.py  clean-vs-regressed pass-rate comparison (section 10)
 .github/workflows/ci-cd.yml  eval-gate -> build-and-push -> deploy (sections 9, 11)
-infra/cloudformation/*.yaml  ECS/ALB/ECR/RDS+pgvector/autoscaling and the LangFuse EC2 stack (section 11)
+infra/cloudformation/*.yaml  ECS/ALB/ECR/RDS+pgvector/autoscaling stack (section 11)
 data/orders.json           mock order database
 data/accounts.json         mock account database (active / flagged / suspended)
 data/ticket_history.json   mock prior-ticket history, keyed by customer_id
@@ -256,12 +256,13 @@ decorators on `classify_node`, `retrieve_node`, `decide_node`,
 `SupportHarness.handle_turn` (the top-level `agent` span every child span
 nests under).
 
-One-time setup, either option:
-- **Self-hosted** (free, matches what this project's CloudFormation deploys
-  for the live demo): `bash infra/deploy_langfuse_stack.sh` -- see section 11.
-  Prints the dashboard URL and login.
-- **LangFuse Cloud free tier**: create a project at
-  [cloud.langfuse.com](https://cloud.langfuse.com), grab its keys.
+One-time setup: create a free project at
+[cloud.langfuse.com](https://cloud.langfuse.com) (LangFuse Cloud) and grab
+its keys. (An earlier version of this project also had a self-hosted
+LangFuse-on-EC2 CloudFormation option; it was never actually deployed and
+has been removed to keep the infra directory to what's actually used --
+LangFuse Cloud's free tier is a fully legitimate choice per the assignment's
+own build guide, not a compromise.)
 
 Either way, set these three variables in `.env` (already in
 `.env.example`):
@@ -282,10 +283,9 @@ confirm they show up correctly nested in the dashboard before relying on it
 for the video demo.
 
 **For the deployed agent specifically:** `deploy_agent_stack.sh` seeds
-placeholder `"unset"` values into the three `LANGFUSE_*` SSM parameters if
-`deploy_langfuse_stack.sh` hasn't been run first (i.e. if you're using
-LangFuse Cloud rather than self-hosting). Update them with your real
-credentials before relying on the deployed agent's traces:
+placeholder `"unset"` values into the three `LANGFUSE_*` SSM parameters --
+update them with your real LangFuse Cloud credentials before relying on the
+deployed agent's traces:
 ```bash
 aws ssm put-parameter --name "/ecommerce-support-agent/LANGFUSE_HOST" --value "https://cloud.langfuse.com" --type SecureString --overwrite
 aws ssm put-parameter --name "/ecommerce-support-agent/LANGFUSE_PUBLIC_KEY" --value "pk-lf-..." --type SecureString --overwrite
@@ -629,7 +629,6 @@ export GITHUB_REPO=<this-repo-name>
 export GROQ_API_KEY=<a-real-groq-key>
 export DB_MASTER_PASSWORD=<a-strong-password>
 bash infra/deploy_agent_stack.sh          # ECS/ALB/ECR/RDS/autoscaling stack
-bash infra/deploy_langfuse_stack.sh       # self-hosted LangFuse (optional if using LangFuse Cloud)
 ```
 `deploy_agent_stack.sh` prints the `AWS_DEPLOY_ROLE_ARN` and `AWS_REGION` to
 add as GitHub repo **variables** (not secrets -- the role ARN isn't
@@ -651,9 +650,8 @@ AWS_SECRET_ACCESS_KEY .` returning nothing.
 ```bash
 export AWS_REGION=us-east-1   # match whatever you deployed with
 bash infra/teardown_agent_stack.sh      # empties ECR, deletes ECS/ALB/RDS/IAM stack, deletes SSM params
-bash infra/teardown_langfuse_stack.sh   # deletes the LangFuse EC2 instance + Elastic IP
 ```
-Both are tested, not just described -- `teardown_agent_stack.sh` empties the
+Tested, not just described -- `teardown_agent_stack.sh` empties the
 ECR repo first (CloudFormation won't delete a non-empty one) and waits on
 `cloudformation wait stack-delete-complete` before reporting done. The
 GitHub OIDC provider (`infra/setup_oidc_provider.sh`) is never torn down --
