@@ -111,7 +111,7 @@ mcp_server/server.py       the MCP server -- exposes lookup_order and check_acco
 agent/harness.py           the harness -- a LangGraph StateGraph: classify -> retrieve -> memory -> decide -> validate -> act -> respond
 agent/provider.py          LLMProvider abstraction: GroqProvider (functional) + BedrockProvider (documented stub, see section 13)
 agent/mcp_client.py        spawns mcp_server/server.py and talks to it over MCP (stdio)
-agent/rag.py               local hybrid retriever: BM25 (lexical) + FAISS/sentence-transformers (semantic) over policies/
+agent/rag.py               local retriever over policies/ -- BM25 (lexical) only for local dev; the FAISS/sentence-transformers semantic half is temporarily disabled (see its module docstring) now that pgvector is the real semantic backend (below)
 agent/rag_pgvector.py      RDS PostgreSQL + pgvector retriever -- same fusion math, used when DATABASE_URL is set (see section 11)
 agent/classify.py          rule-based ticket-type classifier
 agent/memory.py            ShortTermMemory (this conversation) and LongTermMemory (this customer's ticket history)
@@ -215,15 +215,14 @@ inside the tool function alone; the harness enforcing it before dispatch is
 what makes it a real boundary rather than something bolted on afterward.
 
 **RAG grounding is logged, not just claimed, and hybrid to reduce
-hallucination.** `agent/rag.py`'s `HybridPolicyRetriever` fuses two signals
-per query:
-- **BM25** (lexical, standard-library only) -- a strictly better lexical
-  ranker than plain TF-IDF cosine, but still capped at scoring shared
-  vocabulary.
-- **Dense vector similarity** (semantic) -- a local `sentence-transformers`
-  model (`all-MiniLM-L6-v2`) embeds every policy doc, indexed in FAISS
-  (`IndexFlatIP`, exact search), so a question that rephrases a policy with
-  *zero* shared words can still be found.
+hallucination.** `agent/rag.py`'s `HybridPolicyRetriever` was designed to
+fuse two signals per query -- **BM25** (lexical, standard-library only) and
+**dense vector similarity** (semantic, local `sentence-transformers` +
+FAISS) -- so a question that rephrases a policy with *zero* shared words
+can still be found. As of Assignment 2, the local FAISS/sentence-transformers
+half is disabled by default (BM25-only fallback) since `agent/rag_pgvector.py`
++ RDS pgvector (section 11) is now the real semantic backend for the
+deployed agent; local dev without `DATABASE_URL` set is lexical-only.
 
 They're fused 20% lexical / 80% vector by default (shifted to 100% BM25 if
 the embedding backend can't load) -- calibrated against a held-out set of
@@ -282,6 +281,21 @@ Run a handful of real tickets (`python main.py` or `python demo.py`) and
 confirm they show up correctly nested in the dashboard before relying on it
 for the video demo.
 
+**For the deployed agent specifically:** `deploy_agent_stack.sh` seeds
+placeholder `"unset"` values into the three `LANGFUSE_*` SSM parameters if
+`deploy_langfuse_stack.sh` hasn't been run first (i.e. if you're using
+LangFuse Cloud rather than self-hosting). Update them with your real
+credentials before relying on the deployed agent's traces:
+```bash
+aws ssm put-parameter --name "/ecommerce-support-agent/LANGFUSE_HOST" --value "https://cloud.langfuse.com" --type SecureString --overwrite
+aws ssm put-parameter --name "/ecommerce-support-agent/LANGFUSE_PUBLIC_KEY" --value "pk-lf-..." --type SecureString --overwrite
+aws ssm put-parameter --name "/ecommerce-support-agent/LANGFUSE_SECRET_KEY" --value "sk-lf-..." --type SecureString --overwrite
+aws ecs update-service --cluster ecommerce-support-agent-cluster --service ecommerce-support-agent-service --force-new-deployment
+```
+SSM secrets are injected as environment variables at container startup, not
+live-refreshed -- the `force-new-deployment` is required for a running task
+to actually pick up updated values.
+
 ## 8. Trajectory evaluation and LLM-as-judge
 
 **Trajectory eval** (`eval/trajectory_eval.py`) scores whether the right
@@ -315,16 +329,50 @@ python -m eval.llm_judge                 # first 5 tickets, 3 judge runs each (a
 python -m eval.llm_judge --tickets 12 --runs 5
 ```
 
-**Finding a real "confident wrong path" case:** run `demo.py` or a few
-turns of `main.py`, open the corresponding traces in LangFuse, and look for
-a ticket where the final answer reads fine but the trace shows something
-off -- a retrieval that returned the wrong doc but got cited anyway, a tool
-called with a plausible-looking but wrong argument, or (most directly
-reproducible here) a turn where `AGENT_REGRESSED=true` silently drops
-grounding and the model still answers confidently from its own general
-knowledge instead of admitting the gap (see section 9). Document the actual
-case you find here, with the trace/trajectory excerpt, before submitting --
-this has to be a real finding, not a hypothetical.
+**Actual reported scores** (5 tickets, 3 judge runs each, against the live
+deployed agent):
+
+| Ticket | Groundedness (mean, stdev) | Task success (mean, stdev) |
+|---|---|---|
+| `t1_order_status_shipped` | 10.0, 0.0 | 10.0, 0.0 |
+| `t2_order_status_tracking` | 9.33, 0.47 | 10.0, 0.0 |
+| `t3_order_status_processing` | 7.0, 0.0 | 10.0, 0.0 |
+| `t4_delivery_late` | 4.67, 0.47 | 10.0, 0.0 |
+| `t5_delivery_lost` | 2.67, 0.47 | 10.0, 0.0 |
+
+**Overall: groundedness 6.73/10, task_success 10.0/10.** The split matters:
+every response fully addressed what the customer asked (task_success is a
+clean 10 across the board), but groundedness drops sharply on the delivery
+tickets -- a response can satisfy the customer's actual question while still
+citing details the judge couldn't verify against the reference. That gap is
+exactly why this project scores the two dimensions separately instead of one
+blended "quality" number.
+
+**A real "confident wrong path" case (found via LangFuse, not manufactured):**
+
+Trace ID `119d9e059b6127e0e81673297fab3327` -- customer CUST005 asks: *"My
+account is under review and I want to stop being charged every month, what
+do I do?"* The final answer reads completely fine on its own: a confident,
+specific 4-step subscription-cancellation procedure ("Log in... Go to
+Account -> Subscriptions... Select the Plus (monthly) plan and choose Cancel
+subscription... Confirm the cancellation").
+
+The trace's `retrieve_policy` span, however, shows
+`retrieved_doc_ids: ['account_suspension_appeal']` -- `subscription_cancellation.md`
+was **never retrieved at all**. Checking both docs directly: neither
+contains any UI navigation steps (`account_suspension_appeal.md` covers
+appeal timelines; `subscription_cancellation.md` covers only billing/refund
+rules). The entire 4-step procedure is fabricated from the model's general
+training knowledge, not grounded in anything the agent was actually given.
+
+Root cause: the query blends two topics (suspension + cancellation);
+retrieval (`top_k=2`, `min_fused_score` threshold) only surfaced the
+suspension doc as relevant enough, and the system prompt's honest-gap
+instruction only fires when *nothing* is retrieved -- not when something
+*partially* relevant is retrieved and the model fills in the rest from
+memory. A final-answer-only check would have waved this straight through;
+only the trajectory (which doc was actually retrieved vs. what was actually
+claimed) reveals it.
 
 ## 8a. Full evaluation taxonomy (all six axes, five layers, three techniques)
 
@@ -393,23 +441,27 @@ the same name). Relative, not absolute: fails only if the current pass rate
 drops more than 15 points below `eval/baseline.json`, not if it's simply
 under some fixed number.
 
-**Demonstrating the gate blocking a real regressed push:** the repo's
-regression flag is `AGENT_REGRESSED` (see `agent/harness.py`'s
+**Demonstrating the gate blocking a real regressed push (done, live, twice):**
+the repo's regression flag is `AGENT_REGRESSED` (see `agent/harness.py`'s
 `retrieve_node` -- when true, retrieval is silently disabled, simulating a
 broken grounding step without touching anything else about the agent, the
 same discipline as `agent-cicd-demo`'s `AGENT_REGRESSED` tool-removal flag).
-To push the actual demo:
+The actual demo pushed two commits to the `regression-demo` branch:
 
-```bash
-git checkout -b regression-demo
-# edit Dockerfile: add `ENV AGENT_REGRESSED=true`
-git commit -am "regression-demo: disable RAG grounding"
-git push -u origin regression-demo
-```
-
-`ci-cd.yml` triggers on both `main` and `regression-demo`; on the latter,
-`eval-gate` should fail in a real GitHub Actions run (screenshot/log
-required per section 3, not a description).
+1. **The regression** -- flipped `AGENT_REGRESSED`'s default from `false` to
+   `true` in `agent/harness.py` (a one-line diff). Real GitHub Actions run:
+   [`31295569394`](https://github.com/Adrita2211/assignment-1/actions/runs/31295569394)
+   -- `eval-gate` job **FAILED** (`Run trajectory-eval regression gate` step,
+   exit code 1). Log: `Baseline: 91.7% | Current: 58.3% | Drop: 33.4 points |
+   Threshold: 15.0 points -- REGRESSION GATE: FAILED`. `build-and-push` and
+   `deploy` never ran (blocked by `needs: eval-gate`).
+2. **The fix** -- reverted the default back to `false`. Real run:
+   [`31296910028`](https://github.com/Adrita2211/assignment-1/actions/runs/31296910028)
+   -- `eval-gate` **passed**, and this time `build-and-push`/`deploy` ran for
+   real: a commit-SHA-tagged image (`ecommerce-support-agent:b241a699ffd199bec1f509ee8e4f6993cb045cf3`)
+   was built by GitHub's runners, pushed to ECR via OIDC, and deployed to the
+   live ECS service -- confirmed by hitting the ALB URL post-deploy and
+   checking the running task definition's image tag.
 
 ## 10. Before/after report and defensible justifications
 
@@ -422,9 +474,28 @@ the regression flag forced on -- and prints both pass rates plus exactly
 which ticket IDs flipped from PASS to FAIL. This is the number for the
 README/PR description; the CI gate above is what actually blocks the
 regressed build from deploying, this script just documents the drop it
-would have caused. (Run it locally and paste the real output here before
-submitting -- the exact numbers depend on a live model run and aren't baked
-into this repo.)
+would have caused.
+
+**Actual output from a real run:**
+
+```
+======================================================================
+BEFORE / AFTER REPORT
+======================================================================
+Clean pass rate:     91.7%
+Regressed pass rate: 58.3%
+Drop:                33.4 points
+
+Tickets that flipped PASS -> FAIL (4):
+  - t6_delivery_policy_general
+  - t7_refund_damaged
+  - t9_refund_eligibility_window
+  - t10_subscription_cancel_policy
+======================================================================
+```
+
+91.7% to 58.3%, a 33.4-point drop -- well past the 15-point gate threshold,
+consistent with the live GitHub Actions failure in section 9.
 
 **Justification 1 -- why the threshold is 15 points, not looser or
 tighter:** with 12 fixed tickets, one ticket flipping is an 8.3-point swing.
@@ -479,6 +550,38 @@ aws cloudformation describe-stacks --stack-name ecommerce-support-agent-infra \
   --query "Stacks[0].Outputs[?OutputKey=='AlbDnsName'].OutputValue" --output text
 ```
 
+**Live values for this deployment** (account `058264386876`, region `us-east-1`):
+- **ALB URL:** `http://ecommerce-support-agent-alb-580202083.us-east-1.elb.amazonaws.com`
+- **RDS endpoint:** `ecommerce-support-agent-db.cd8k6wsa4mwz.us-east-1.rds.amazonaws.com`
+- **GitHub deploy role ARN:** `arn:aws:iam::058264386876:role/ecommerce-support-agent-github-deploy-role`
+
+```bash
+curl http://ecommerce-support-agent-alb-580202083.us-east-1.elb.amazonaws.com/health
+curl -X POST http://ecommerce-support-agent-alb-580202083.us-east-1.elb.amazonaws.com/chat \
+  -H "Content-Type: application/json" \
+  -d '{"customer_id": "CUST002", "message": "Where is my order ORD1002?"}'
+```
+
+**Gotchas hit deploying this from Windows/Git Bash, for whoever runs this next:**
+- **No default VPC in the account/region:** `deploy_agent_stack.sh`'s automatic
+  VPC/subnet lookup returns nothing if none exists. Fix once:
+  `aws ec2 create-default-vpc --region us-east-1`.
+- **Git Bash's MSYS path conversion** mangles anything that looks like an
+  absolute POSIX path -- including SSM parameter names (`/ecommerce-support-agent/...`)
+  and `--template-file` arguments, in opposite directions. Set
+  `export MSYS_NO_PATHCONV=1` before running any `aws` command from Git Bash
+  on Windows (the deploy/teardown scripts' `SCRIPT_DIR` already uses `pwd -W`
+  to sidestep the template-file half of this).
+- **CloudFormation's `Description` field caps at 1024 characters** -- keep
+  template-level rationale in `#` comments, not the `Description:` key.
+- **Seeding pgvector from outside the VPC:** the RDS instance is
+  `PubliclyAccessible: false` by design (private subnet, ECS-only security
+  group). To run `scripts/seed_pgvector.py` from a local machine, temporarily
+  flip it (`aws rds modify-db-instance --publicly-accessible --apply-immediately`),
+  open the DB security group to your IP for port 5432, seed, then revert both
+  immediately after. DNS takes a few minutes to actually propagate the public
+  address after the flag change -- don't assume it's instant.
+
 **RDS + pgvector wiring:** `agent/rag_pgvector.py`'s `PgVectorPolicyRetriever`
 is used automatically whenever `DATABASE_URL` is set (see
 `agent/harness.py`'s `_shared_retriever()`); unset, the agent falls back to
@@ -502,6 +605,22 @@ a production capacity plan. To trigger and observe a real scale-out event:
 fire a burst of concurrent requests at the ALB URL's `/chat` endpoint (a
 simple `for`-loop with backgrounded `curl`s is enough) and watch the ECS
 console's task count for the service actually increase.
+
+**Actual scale-out event (real, captured via CLI):** sustained concurrent
+load against `/chat` pushed `AWS/ECS` `CPUUtilization` to 74-96% for several
+minutes. Application Auto Scaling's `describe-scaling-activities` recorded:
+
+```
+Description: "Setting desired count to 2."
+Cause: "monitor alarm TargetTracking-service/ecommerce-support-agent-cluster/
+        ecommerce-support-agent-service-AlarmHigh-... in state ALARM
+        triggered policy ecommerce-support-agent-cpu-target-tracking"
+```
+
+`desiredCount` went 1 -> 2, `runningCount` followed (briefly hit 3 during the
+transition), and settled at `desiredCount: 2, runningCount: 2` once load
+stopped. Scaled back in on its own after the 120s cooldown confirmed
+sustained low CPU.
 
 **Deploying:**
 ```bash
