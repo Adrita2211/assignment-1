@@ -296,6 +296,21 @@ SSM secrets are injected as environment variables at container startup, not
 live-refreshed -- the `force-new-deployment` is required for a running task
 to actually pick up updated values.
 
+**NB -- traces vs. scores, deliberately different scopes:** every real
+request (a live `/chat` call, `demo.py`, `main.py`) produces a full,
+correctly-nested **trace** -- that satisfies section 2.1's requirement on
+its own. **Scores**, however, only attach to traces produced by actually
+running one of the `eval/*.py` scripts against the fixed ticket set (see
+`eval/langfuse_scores.py`'s `push_score()`, called from
+`trajectory_eval.py`, `calibration_eval.py`, etc.) -- a plain live request
+is never scored. This is intentional, not a gap: scoring is a batch
+evaluation-suite concept (comparing a fixed, known ticket set against a
+baseline over time), not a live-monitoring feature. Scoring every live
+customer request would mean an extra LLM-judge call (cost + latency) per
+real interaction just to populate a dashboard -- a real production system
+that wants that would sample a small percentage of live traffic for
+background scoring, which this project doesn't attempt and wasn't asked to.
+
 ## 8. Trajectory evaluation and LLM-as-judge
 
 **Trajectory eval** (`eval/trajectory_eval.py`) scores whether the right
@@ -347,6 +362,19 @@ tickets -- a response can satisfy the customer's actual question while still
 citing details the judge couldn't verify against the reference. That gap is
 exactly why this project scores the two dimensions separately instead of one
 blended "quality" number.
+
+**NB -- known limitation: the judge and the agent share the same model.**
+`eval/llm_judge.py` and `eval/calibration_eval.py` both instantiate a fresh
+`GroqProvider()` (same `openai/gpt-oss-120b` model the agent itself uses)
+as the judge, rather than a separate, ideally more capable model. This was
+a cost decision -- Groq's free tier -- not a methodologically sound one: a
+model judging its own family's output risks being systematically lenient
+toward its own phrasing/reasoning patterns and sharing its own blind spots,
+rather than catching them independently. The correct design would use a
+distinct judge model (e.g. a larger/different-provider model) precisely
+*because* it wouldn't share the generator's failure modes. Worth fixing
+before trusting these scores for anything beyond this assignment's demo
+purposes.
 
 **A real "confident wrong path" case (found via LangFuse, not manufactured):**
 
