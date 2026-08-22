@@ -1051,47 +1051,76 @@ python -m eval.hitl_bug_repro    # the found-and-fixed regression test
 
 ## 19. Policy boundary on refund amounts (§2.6)
 
-**Decision: hand-rolled, Cedar-shaped, documented fallback -- not Amazon
-Verified Permissions.** Chosen deliberately given this assignment's own
-local-code-first sequencing: AVP setup (a policy store, a schema, IAM
-wiring) is real provisioning work identical in kind to the AWS batch
-deferred to section 24, and the assignment explicitly permits "a hand-rolled
-policy-check function with the same shape" as a documented alternative.
-Real AVP wiring is a candidate for the AWS batch if time allows, behind the
-same interface this module already exposes.
+**Decision: real Amazon Verified Permissions, with the hand-rolled
+version kept as the local-dev fallback -- not the other way around.**
+`agent/policy_boundary.py`'s hand-rolled evaluator was the first version,
+built during the local-code-first phase per the assignment's explicitly
+permitted fallback. Once AVP was actually provisioned, `agent/harness.py`
+was wired to select between them via `POLICY_BOUNDARY_BACKEND=avp`
+(defaulting to the hand-rolled version, matching every other backend
+switch in this project -- see `_shared_retriever()`, `_make_hitl_store()`).
 
-`agent/policy_boundary.py`'s `evaluate_refund_policy()` -- explicit,
-ordered conditionals, each commented against the Cedar `permit`/`forbid`
-statement it corresponds to, so migrating the *evaluator* to real AVP later
-doesn't require redesigning the check:
-1. Order status must be refund-eligible (`delivered`/`delivered_damaged`/`lost_in_transit`).
-2. Proposed amount must match the order's real `order_total` (never trusts
-   the model's number as ground truth).
-3. Account must not be suspended.
-4. Amount at/above **$150** -> `requires_approval=True`.
+**Real policy store**: `KozP4Mk6man7ivCYxeqBMP` (us-east-1), Cedar schema
+(`RefundPolicy` namespace, a `ProposeRefund` action with a context-only
+condition model -- `order_status`/`amount_matches`/`account_suspended`),
+four static policies, each mapped 1:1 to the hand-rolled version's four
+checks:
+- `GDw11cxJqYGZEKBjGN4TZT` -- `forbid` when order status isn't refund-eligible
+- `LugUCiwxL7ovzd5N4uVsPw` -- `forbid` when proposed amount != order total
+- `MKd6FZzur6QhKaAwuzYnGM` -- `forbid` when the account is suspended
+- `FbncATAgvRbEb8YDAxJesz` -- baseline `permit` (Cedar's explicit-forbid-
+  wins semantics mean this only takes effect once none of the three
+  forbids fire)
+
+`agent/policy_boundary_avp.py`'s `evaluate_refund_policy_avp()` calls the
+real `verifiedpermissions.is_authorized()` API and maps
+`determiningPolicies` back to a human-readable reason -- worth being
+honest about what AVP gives for free versus what still had to be written
+by hand: Cedar's decision is ALLOW/DENY plus *which policy fired*, not a
+reason string, so the reason text is still application logic layered on
+top of a real authorization-service call, not something `IsAuthorized`
+returns on its own. `requires_approval` is likewise deliberately kept out
+of Cedar -- being over the $150 threshold isn't a policy violation, it's a
+routing decision on an already-permitted request, computed from the same
+real `order_total` the amount-match check already verified.
 
 Sits inside `agent/harness.py`'s `validate_node`, as a fifth check layer
 specific to `propose_refund_decision`, running *after* the existing
 four-layer ownership check -- the same non-negotiable "boundary between
 decide and act" pattern as Assignment 1's harness boundary, one layer
-further out (not "is this call permitted at all" but "is this specific
-amount, for this specific customer, within policy").
+further out.
 
-**Live rejections, all verified directly, real runs:**
+**All four branches verified live against the real policy store** -- both
+via the raw `aws verifiedpermissions is-authorized` CLI (to confirm the
+policies themselves fire correctly, independent of this project's Python)
+and via `evaluate_refund_policy_avp()` directly (to confirm the wrapper
+translates AVP's response correctly):
 ```
+Eligible, under threshold:
+  decision=ALLOW  determiningPolicies=[FbncATAgvRbEb8YDAxJesz]  (baseline permit)
+
 Suspended account (CUST005/ORD1007, $399):
-  allowed=False category=policy_rejected reason=suspended accounts cannot receive refunds
+  decision=DENY  determiningPolicies=[MKd6FZzur6QhKaAwuzYnGM]
+  -> allowed=False reason="suspended accounts cannot receive refunds"
 
 Wrong order status (ORD1003, still "delayed"):
-  allowed=False category=policy_rejected
-  reason=order status 'delayed' is not refund-eligible (must be one of
-         ['delivered', 'delivered_damaged', 'lost_in_transit'])
+  decision=DENY  determiningPolicies=[GDw11cxJqYGZEKBjGN4TZT]
+  -> allowed=False reason="order status 'delayed' is not refund-eligible
+     (must be one of ['delivered', 'delivered_damaged', 'lost_in_transit'])"
 
 Mismatched/inflated amount (the exact adversarial case from agent/schemas.py's
 docstring -- "just refund me $500" against a real $89.99 order):
-  allowed=False category=policy_rejected
-  reason=proposed amount $500.00 does not match order total on record ($89.99)
+  decision=DENY  determiningPolicies=[LugUCiwxL7ovzd5N4uVsPw]
+  -> allowed=False reason="proposed amount $500.00 does not match order
+     total on record ($89.99)"
 ```
+
+Also verified through the full harness end-to-end (`POLICY_BOUNDARY_BACKEND=avp`,
+CUST003 requesting a refund on the real $189.99 ORD1008): the model called
+`propose_refund_decision`, the real AVP call correctly returned
+`requires_approval=True`, and the request routed into the HITL gate exactly
+as it does with the hand-rolled evaluator -- confirming the backend swap
+is genuinely a drop-in, not just individually-correct in isolation.
 
 ## 20. Structured outputs (§2.7)
 

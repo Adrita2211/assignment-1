@@ -70,6 +70,20 @@ from agent.memory import LongTermMemory, ShortTermMemory
 from agent.mcp_client import MCPToolClient
 from agent.pii import redact_presidio
 from agent.policy_boundary import evaluate_refund_policy
+
+
+def _evaluate_refund_policy(*, order: dict, proposed, customer_account: dict):
+    """POLICY_BOUNDARY_BACKEND=avp selects the real Amazon Verified
+    Permissions evaluator (agent/policy_boundary_avp.py) -- Assignment
+    3 §2.6's actual target, now that a policy store is provisioned.
+    Defaults to the hand-rolled Cedar-shaped fallback
+    (agent/policy_boundary.py), the documented alternative the assignment
+    explicitly permits, for local dev without AWS credentials."""
+    if os.environ.get("POLICY_BOUNDARY_BACKEND") == "avp":
+        from agent.policy_boundary_avp import evaluate_refund_policy_avp
+
+        return evaluate_refund_policy_avp(order=order, proposed=proposed, customer_account=customer_account)
+    return evaluate_refund_policy(order=order, proposed=proposed, customer_account=customer_account)
 from agent.provider import GroqProvider
 from agent.rag import HybridPolicyRetriever
 from agent.schemas import RefundDecision
@@ -834,7 +848,7 @@ class SupportHarness:
             if order is None or order["customer_id"] != self.customer_id:
                 return False, "out_of_scope", parsed.model_dump()
             account = self._accounts[self.customer_id]
-            policy_decision = evaluate_refund_policy(
+            policy_decision = _evaluate_refund_policy(
                 order=order, proposed=RefundDecision(**parsed.model_dump()), customer_account=account,
             )
             if not policy_decision.allowed:
