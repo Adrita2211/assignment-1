@@ -59,7 +59,18 @@ class MCPToolClient:
         never itself the final reply -- it's an intermediate message the
         trace still captures in full. This is the real, found leak
         documented in the README.
+
+        customer_id is unconditionally injected/overwritten here, on every
+        call, regardless of what's in `arguments` already -- mcp_server/server.py's
+        tools now take customer_id as a real parameter (the Gateway
+        migration's multi-tenant fix), but that value must NEVER come from
+        the model's own tool-call arguments (a manipulated prompt could
+        otherwise just claim to be a different customer and walk straight
+        past every ownership check). Centralizing the override here, not
+        at each call site in agent/harness.py, means it can't be forgotten
+        for a future tool.
         """
+        arguments = {**arguments, "customer_id": self.customer_id}
         try:
             result = await self.session.call_tool(name, arguments)
         except Exception as exc:  # MCP schema/validation errors surface here
