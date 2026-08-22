@@ -857,16 +857,57 @@ section is about. `LLM_PROVIDER=bedrock` now selects `BedrockProvider`
 note below for why Nova and not Claude), matching every other
 env-var-driven backend switch in this project.
 
-**Session-state honesty note, now genuinely verified, not just expected:**
-`agentcore configure` auto-provisioned a real AgentCore Memory resource
-(`ecommerce_support_agent_mem-...`, `STM_ONLY` mode, 30-day retention) as
-part of default configuration, and Observability (CloudWatch Logs + X-Ray
-traces) auto-enabled on deploy too -- both confirmed from real deploy
-output, not assumed. Neither gives the `PendingAction`/`ApprovalStatus`
+**AgentCore Memory is now actually wired up and used, not just
+auto-provisioned and idle.** `agentcore configure` auto-created a Memory
+resource (`ecommerce_support_agent_mem-...`); `agent/memory_agentcore.py`
+adds two classes (`MEMORY_BACKEND=agentcore`) that replace
+`agent/memory.py`'s prior implementations:
+
+- **`ShortTermMemoryAgentCore`** replaces `ShortTermMemory` -- a real fix,
+  not a cosmetic backend swap: `ShortTermMemory` was an in-process list
+  that lived only as long as one `SupportHarness` instance, and since
+  AgentCore Runtime constructs a fresh harness per invocation (stateless
+  requests), multi-turn memory across *separate* turns of the same support
+  ticket never actually persisted anywhere before this, regardless of
+  backend. Verified live: stored a turn via `MemoryClient.create_event()`,
+  then independently queried `get_last_k_turns()` and got back the exact
+  clean text pair, not a mock.
+- **`LongTermMemoryAgentCore`** replaces `LongTermMemory` -- which was a
+  static, hand-written JSON seed file (`data/ticket_history.json`) that
+  never grew or updated from real conversations; not actually memory in
+  the sense the term usually means, a lookup table. Three real extraction
+  strategies (SEMANTIC, SUMMARY, USER_PREFERENCE) were added to the live
+  Memory resource. Verified live, with zero extraction code written by
+  this project: after a test conversation where a customer said "please
+  always contact me by email, not phone, I never answer calls,"
+  `retrieve_memories()` (polled until extraction completed, ~1-2 minutes
+  asynchronously) returned:
+  ```
+  - The user prefers to be contacted by email only and never answers phone calls.
+  - {"preference":"Prefers to be contacted by email only; never answers phone calls",
+     "categories":["communication","contact preferences"]}
+  ```
+  An LLM, managed entirely by AWS, read the raw conversation and extracted
+  that fact on its own.
+
+**A real bug found and fixed while verifying this:** the first version of
+`_make_short_term_memory()` (`agent/harness.py`) was decorated with
+`@lru_cache(maxsize=1)`, copied from `_compiled_graph()`'s legitimate
+process-wide-singleton pattern without accounting for the difference --
+short-term memory is per-(customer, ticket) state, not a singleton. That
+single-slot cache meant **every** `SupportHarness` instance in a process,
+regardless of which customer or ticket, received the exact same memory
+object. Caught by comparing a direct, isolated call against the same call
+routed through `SupportHarness` and finding they disagreed; confirmed via
+matching Python object ids across two different customers' sessions.
+Removed -- verified afterward that two different customers' sessions in
+the same process now get genuinely independent, empty memory.
+
+Neither Memory nor Observability gives the `PendingAction`/`ApprovalStatus`
 state machine (section 18) for free, though -- that logic (expiry,
 re-validation, the resource-keyed uniqueness guard) is still hand-built
-regardless of backend, now on Aurora (section 18) rather than AgentCore's
-own Memory API, since Memory is conversation-context-shaped, not a
+regardless of backend, on Aurora (section 18) rather than AgentCore's own
+Memory API, since Memory is conversation-context-shaped, not a
 business-workflow-approval-state primitive.
 
 **HITL pause/resume is reachable through the same deployed endpoint**, not
@@ -878,6 +919,55 @@ live end-to-end: `agentcore invoke` created a real pending approval via
 the normal chat path, then a second `agentcore invoke '{"action":
 "resume_approval", ...}'` call against the same deployed endpoint
 approved and executed it (see section 18 for the full transcript).
+
+**AgentCore Gateway was evaluated and deliberately not built** -- read
+the real considerations, not a hand-wave. Gateway's actual value
+proposition (per AWS's own introductory material) is solving the "M×N"
+tool/agent integration problem: many agents sharing many tools need
+centralized discovery, auth, and governance. This project has **one
+agent and three tools**, all already correctly secured at two layers
+(the harness-level ownership check, `agent/harness.py`'s
+`_validate_and_check_permission`, plus the MCP server's own re-check).
+Adding Gateway here would mean: a real network hop and OAuth token
+exchange for every tool call that currently runs in-process in
+milliseconds; a Cognito user pool (or equivalent) for Gateway's inbound
+JWT auth; either a second full AgentCore Runtime deployment (the
+`mcpServer` target type) or three separate Lambda functions (the
+lighter-weight `lambda` target type AWS's own getting-started material
+actually leads with) plus their own IAM roles; and a Gateway execution
+role of its own -- for zero new capability over what already works and
+is already live-verified. Gateway earns its cost past a scale this
+project doesn't have; building it here would be adding enterprise-scale
+infrastructure to a project that doesn't need it, not a demonstration of
+depth.
+
+**What the Gateway investigation *did* produce, kept and real:** a
+genuine multi-tenancy bug in `mcp_server/server.py`, found by seriously
+working through what a Gateway-fronted (shared, persistent, concurrent)
+server would require. `SESSION_CUSTOMER_ID` was a **module-level global**,
+read once when the process started -- correct only because the original
+design spawned a fresh subprocess per ticket. A persistent, multi-customer
+server sharing that global would race across concurrent requests from
+different customers. Fixed regardless of the Gateway decision:
+`lookup_order`/`issue_refund` now take `customer_id` as a real, explicit
+parameter (`check_account_status` already did), and `agent/mcp_client.py`'s
+`call_tool()` unconditionally injects/overwrites `customer_id` on every
+call -- centrally, in one place, so the model's own tool-call arguments
+can never supply a different customer_id and walk past ownership checks.
+Verified: the existing local stdio path still works end-to-end after this
+change.
+
+**A second real bug found and fixed live, unrelated to Memory or Gateway:**
+the deployed AgentCore Runtime container runs as a non-root user, and
+`agent/cost_ledger.py`'s local SQLite write failed with `attempt to write
+a readonly database`, taking down every turn that reached `decide_node`
+with a real 500 error -- reproduced live via `agentcore invoke`, diagnosed
+from real CloudWatch logs. Fixed by making cost-ledger writes non-fatal
+(cost tracking is pure telemetry; a failed write must never block the
+actual customer response) -- deliberately **not** applied to
+`agent/hitl_store.py`, where a lost approval-record write is a safety
+issue, not a reporting gap, and should stay fatal. Redeployed and
+re-verified live afterward: the endpoint responds correctly again.
 
 ## 16. Bedrock Knowledge Base migration (§2.3)
 
