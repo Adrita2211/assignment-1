@@ -50,7 +50,7 @@ def _leak_strings_for(ticket: dict) -> list[str]:
     leaks = []
     if ticket.get("target_order_id"):
         order = ORDERS[ticket["target_order_id"]]
-        leaks.extend(order["items"])
+        leaks.extend(item["name"] for item in order["items"])
         leaks.append(order["status"])
     if ticket.get("target_customer_id"):
         account = ACCOUNTS[ticket["target_customer_id"]]
