@@ -57,10 +57,17 @@ def _estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> flo
 class CostLedger:
     def __init__(self, db_path: Path = DB_PATH):
         self.db_path = db_path
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self.db_path)
-        self._conn.execute(SCHEMA)
-        self._conn.commit()
+        try:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._conn = sqlite3.connect(self.db_path)
+            self._conn.execute(SCHEMA)
+            self._conn.commit()
+        except (sqlite3.OperationalError, OSError) as exc:
+            # Same reasoning as record()'s try/except -- must not crash
+            # SupportHarness.__init__ (which every single turn depends on)
+            # over a pure-telemetry write failure.
+            print(f"[COST_LEDGER] init failed, cost tracking disabled for this session: {exc}")
+            self._conn = None
 
     def record(
         self,
@@ -74,19 +81,32 @@ class CostLedger:
         latency_s: float,
         error: str | None = None,
     ) -> None:
+        if self._conn is None:
+            return
         cost_usd = _estimate_cost_usd(model, input_tokens, output_tokens)
-        self._conn.execute(
-            """
-            INSERT INTO llm_calls
-                (ticket_id, step, provider, model, input_tokens, output_tokens, cost_usd, latency_s, error, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                ticket_id, step, provider, model, input_tokens, output_tokens,
-                cost_usd, latency_s, error, datetime.now(timezone.utc).isoformat(),
-            ),
-        )
-        self._conn.commit()
+        try:
+            self._conn.execute(
+                """
+                INSERT INTO llm_calls
+                    (ticket_id, step, provider, model, input_tokens, output_tokens, cost_usd, latency_s, error, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ticket_id, step, provider, model, input_tokens, output_tokens,
+                    cost_usd, latency_s, error, datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            self._conn.commit()
+        except sqlite3.OperationalError as exc:
+            # Cost tracking is pure telemetry -- a failed write here (e.g.
+            # the deployed container's filesystem being read-only for this
+            # non-root process, a real problem this project hit once local
+            # SQLite ran on AgentCore Runtime with no Aurora backend
+            # configured) must never take down the customer-facing turn
+            # itself. Contrast with agent/hitl_store.py, which does NOT
+            # swallow write failures -- a lost approval record is a safety
+            # issue, not a reporting gap, so that one stays fatal on purpose.
+            print(f"[COST_LEDGER] record() failed, continuing without it: {exc}")
 
     def total_spend(self) -> float:
         row = self._conn.execute("SELECT COALESCE(SUM(cost_usd), 0) FROM llm_calls").fetchone()
