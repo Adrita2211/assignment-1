@@ -685,14 +685,571 @@ ECR repo first (CloudFormation won't delete a non-empty one) and waits on
 GitHub OIDC provider (`infra/setup_oidc_provider.sh`) is never torn down --
 it's an account-wide resource other repos may depend on.
 
-## 13. Bedrock-ready path (optional, not attempted as a working provider)
+## 13. Bedrock-ready path (Assignment 2's optional bonus -- superseded by Assignment 3)
 
-`agent/provider.py` defines `LLMProvider` (an ABC with one method,
-`call(messages, tools) -> {"text", "tool_calls"}`), `GroqProvider` (the
-working implementation used everywhere in this repo), and `BedrockProvider`
--- a stub whose `call()` raises `NotImplementedError` and whose docstring
-names the exact call it would make (`bedrock-runtime`'s `converse()` API)
-once implemented. Selected via `LLM_PROVIDER=bedrock` through
-`get_provider()` in the same file. This is a code-shape exercise per the
-assignment's §2.6.4 -- the seam exists and is reviewable; no Bedrock
-infrastructure was deployed.
+**Update: this is no longer a stub.** `agent/provider.py`'s `BedrockProvider`
+was a documented-but-unimplemented seam as of Assignment 2; as of
+Assignment 3 §2.2, `BedrockProvider.call()` is a real, working
+implementation (boto3 `bedrock-runtime` `converse()`), verified against
+this project's actual `TOOLS` schema with a mocked client -- see section 15
+below for the details. This section is kept for history; the current state
+lives in section 15.
+
+---
+
+# Assignment 3: Autonomy Decision, Bedrock Migration, HITL, PII, Cost, and Semantic Cache
+
+Builds on Assignment 2's already-deployed ECS/ALB/RDS agent. This is a real
+architecture *migration*, not an additive layer: the agent consolidates
+onto Bedrock AgentCore + Bedrock Knowledge Bases on Aurora, and the
+Assignment 2 ECS/ALB stack is torn down once that migration is verified
+live (see section 24). Everything below that doesn't require AWS
+provisioning is real, verified code, tested with actual runs -- not
+described. Everything that *does* require AWS provisioning (AgentCore
+itself, the real Knowledge Base, Bedrock Guardrails) is code-complete and
+unit-tested against mocked clients, with the real-AWS verification
+explicitly called out as pending until that provisioning batch runs (see
+section 24 for status).
+
+## 14. The autonomy decision (§2.1)
+
+**Path taken: B -- the written justification for staying single-agent, not
+an A2A handoff.** Full four-question walkthrough, against real tickets and
+real tool calls from this codebase (not the class example restated), lives
+in [`eval/autonomy_decision.md`](eval/autonomy_decision.md). Short version:
+the standard "billing disputes" candidate specialist's job already fully
+exists inside this agent (`propose_refund_decision` + `agent/policy_boundary.py`
++ the HITL gate), there's no real current bottleneck the single-agent shape
+causes, and staying single-agent avoids the one concrete new failure mode
+(a dropped/malformed handoff) a second agent would introduce for zero
+capability gain. Demonstrated against a real ticket that reads like it
+needs a billing specialist (CUST003, ORD1008, $189.99, over the approval
+threshold) -- resolved cleanly end to end by the existing single agent, no
+handoff, real tool calls documented in the file.
+
+## 15. Bedrock AgentCore migration (§2.2)
+
+**Code status: complete and verified locally. AWS deployment: pending the
+provisioning batch (section 24).**
+
+`agentcore_app.py` (repo root) wraps the existing `SupportHarness` in
+`BedrockAgentCoreApp` with a deliberately minimal `@app.entrypoint` --
+`SupportHarness`, its LangGraph structure, and every node
+(`decide_node`/`validate_node`/`hitl_gate_node`/`act_node`) needed **zero**
+changes to fit this wrapper. Verified for real: the entrypoint was actually
+invoked end to end locally (against `LLM_PROVIDER=groq`, the same local-dev
+provider `server.py` always used) and returned a correct, grounded response
+with the right trajectory and trace_id -- this is exactly what `agentcore
+dev` exercises.
+
+```bash
+python -c "
+import asyncio
+from agentcore_app import invoke
+print(asyncio.run(invoke({'customer_id': 'CUST002', 'message': 'Where is my order ORD1002?'})))
+"
+```
+
+**`agent/provider.py`'s `BedrockProvider.call()` is now a real
+implementation**, not the Assignment 2 stub: boto3 `bedrock-runtime`
+`converse()`, with `_to_bedrock_messages` / `_to_bedrock_tool_config` /
+`_from_bedrock_response` translating between this project's OpenAI-shaped
+wire format and Converse's `messages`/`toolConfig` shapes. Verified against
+the **real** `TOOLS` schema from `agent/harness.py` (all 3 tools, including
+`propose_refund_decision`) with a mocked boto3 client -- full request/
+response round trip confirmed without needing real AWS credentials for
+that verification.
+
+**A real finding, not assumed from the assignment text:** the
+`bedrock-agentcore-starter-toolkit` package's `agentcore` CLI (`configure`
+/ `dev` / `deploy`) is what actually provides the commands the assignment
+calls `configure`/`dev`/`launch` -- but the current CLI has **renamed
+`launch` to `deploy`** ("formerly 'launch'" per its own `--help` output),
+and the whole Python starter-toolkit is flagged as deprecated in favor of a
+new npm-based `@aws/agentcore` CLI (`npm install -g @aws/agentcore`). This
+was confirmed by actually installing `bedrock-agentcore==1.22.0` and
+`bedrock-agentcore-starter-toolkit==0.3.12` and inspecting them directly
+(`--help`, `inspect.signature`), not assumed. Whoever runs this next should
+re-check which CLI is current, since this is exactly the "fast-moving AWS
+product" the assignment itself warns about.
+
+**Real commands to reproduce** (Python starter-toolkit CLI, current as of
+this writing):
+```bash
+pip install bedrock-agentcore bedrock-agentcore-starter-toolkit
+agentcore configure --entrypoint agentcore_app.py
+agentcore dev              # local dev server with hot reload, no AWS needed
+agentcore deploy           # real AWS deploy (formerly `launch`)
+agentcore invoke '{"customer_id": "CUST002", "message": "Where is my order ORD1002?"}'
+agentcore destroy          # teardown
+```
+
+**Session-state honesty note (pending real verification):** AgentCore's
+managed session/memory support is expected to absorb multi-turn
+conversation-buffer persistence across invocations (replacing what
+`agent/memory.py`'s `ShortTermMemory` does by hand today). It is **not**
+expected to give the `PendingAction`/`ApprovalStatus` state machine
+(section 18) for free -- that logic (expiry, re-validation, the
+resource-keyed uniqueness guard) is hand-built regardless of backend;
+AgentCore would only absorb "where do the bytes durably live." This claim
+is written from the SDK's documented behavior and needs re-confirming
+against a real `agentcore dev` session before being treated as verified
+fact -- flagged here explicitly rather than silently asserted either way.
+
+## 16. Bedrock Knowledge Base migration (§2.3)
+
+**Code status: complete and verified locally with a mocked client. AWS
+deployment: pending the provisioning batch (section 24).**
+
+`agent/rag_bedrock_kb.py`'s `BedrockKBRetriever` replaces
+`agent/rag_pgvector.py`'s hand-rolled SQL query with the managed
+`bedrock-agent-runtime` `Retrieve` API, backed by Aurora PostgreSQL +
+pgvector as the Knowledge Base's own (KB-managed, not hand-rolled) vector
+store schema. Same `retrieve(query, top_k)` interface as every other
+retriever in this project, so `agent/harness.py`'s `_shared_retriever()`
+selects it via a `BEDROCK_KNOWLEDGE_BASE_ID` env var, checked first (ahead
+of the Assignment 2 `DATABASE_URL`/pgvector path, kept as a documented
+fallback).
+
+Request/response shapes were verified directly against the **installed**
+botocore service model (`client.meta.service_model.operation_model('Retrieve')`)
+before writing this code, not assumed from memory -- `retrievalQuery.text`,
+`retrievalConfiguration.vectorSearchConfiguration.numberOfResults`,
+`retrievalResults[].{content.text, location.s3Location.uri, score}` all
+confirmed real. `retrieve()` itself was then verified with a mocked
+`bedrock-agent-runtime` client: correct request shape, correct
+score-threshold filtering (a low-score result correctly excluded), correct
+doc-id extraction from the S3 object URI.
+
+**`min_score` is explicitly NOT the same value as `agent/rag.py`'s
+`DEFAULT_MIN_FUSED_SCORE` (0.38)** -- Bedrock KB's own relevance score is a
+different metric from this project's hand-tuned BM25+vector fusion. 0.38
+is kept only as a placeholder in `agent/rag_bedrock_kb.py`'s
+`DEFAULT_MIN_SCORE`; it must be re-tuned empirically against the same
+held-out genuine-vs-adversarial query set the original threshold was
+calibrated against, once a real Knowledge Base exists to test against.
+**Not yet done** -- pending section 24's provisioning batch.
+
+**Still to verify for real, once provisioned (both required by the
+assignment, neither assumable):**
+- Prove the new path is genuinely serving traffic: temporarily point
+  `rag_pgvector.py`'s connection at an empty/truncated table and confirm
+  the old path breaks while `BedrockKBRetriever` still returns correct
+  results.
+- Re-confirm the honest-gap behavior (an off-topic question correctly
+  returns nothing) still holds after the migration and threshold re-tune.
+
+## 17. PII detection and redaction, layered (§2.4)
+
+**Fully implemented and verified locally -- the one Bedrock Guardrails half
+is deferred, everything else is real and tested.**
+
+`agent/pii.py`: Microsoft Presidio (`AnalyzerEngine` + `AnonymizerEngine`,
+spaCy `en_core_web_lg`) as the local, always-on layer.
+`redact_bedrock_guardrails()` is a documented seam (raises
+`NotImplementedError` locally, same pattern as `BedrockProvider`'s
+Assignment-2-era stub) for AWS-managed Sensitive Information Filters via
+`ApplyGuardrail`, pending provisioning. `redact_layered()` **unions** both
+layers' findings rather than one replacing the other, per the assignment's
+explicit "these layer, they don't replace each other" requirement.
+
+**Redaction strategy: partial masking**, not full masking or tokenization.
+Full masking (`[REDACTED]`) destroys the agent's ability to usefully
+confirm "the email on file ending in `...@example.com`" back to a
+customer. Tokenization (reversible pseudonymization) adds a key-management
+vault surface this project has no legitimate need for -- nothing
+downstream ever needs the real value revealed again. Partial masking
+(Presidio's real `mask` operator via `OperatorConfig`, e.g.
+`j***@example.com`) balances "customer can recognize their own data enough
+to confirm identity" against "the raw value never appears in a log, trace,
+or LLM-visible transcript." This was empirically demonstrated as a real,
+non-hypothetical cost: asking the agent "what email and phone do you have
+on file for me" returns the customer's **own** data back masked -- the
+conservative default this project chose, at a real (documented, not
+hidden) UX cost.
+
+**Enforced at all three required points:**
+1. **Final customer-facing reply** -- `agent/harness.py`'s `handle_turn`.
+2. **Tool-call results/errors**, before they re-enter `state["messages"]`
+   -- `agent/mcp_client.py`'s `call_tool()`. This is the one that actually
+   matters most: a tool RESULT (e.g. `check_account_status` returning a raw
+   account dict) is never itself the final reply, so redacting only #1
+   never touches it.
+3. **Trace payloads** -- `agent/tracing.py`'s new `safe_span_payload()`
+   wrapper, applied at every `update_current_span`/`update_current_generation`
+   call site in `agent/harness.py` that carries message or tool content.
+
+**Two genuine, empirically-found-and-fixed gaps** (found by actually
+testing against this project's own mock data, not manufactured):
+
+- **The `555-01XX` fake-phone gap.** Presidio's default `PHONE_NUMBER`
+  recognizer is backed by Google's `phonenumbers` library, which validates
+  against real assignable NANP ranges -- and rejects the `555-01XX` block
+  as invalid, because that block is FCC-reserved specifically for fiction.
+  Verified directly: `'+1-212-9876543'` -> correctly detected as
+  `PHONE_NUMBER`; `'+1-555-0142'` (this project's own mock phone numbers,
+  in `data/accounts.json`, deliberately chosen to avoid colliding with a
+  real person) -> **nothing detected at all**. The safe-data choice and the
+  detection gap are directly the same decision.
+- **No default street-address recognizer.** Presidio ships nothing for
+  street addresses (only city/state via its `LOCATION`/NER entity).
+  Verified directly: `'482 Birchwood Ave'` -> nothing detected.
+
+**Fix:** two custom `PatternRecognizer`s (`NANP_FAKE_PHONE`,
+`US_STREET_ADDRESS`) registered into Presidio's registry -- the same
+approach the assignment's own PAN/Aadhaar example uses. Re-ran the exact
+same `check_account_status` call after the fix:
+
+```
+RAW:      {'phone': '+1-555-0142', 'shipping_address': {'street': '482 Birchwood Ave', ...}}
+BEFORE:   {'phone': '+1-555-0142', 'shipping_address': {'street': '482 Birchwood Ave', ...}}   <- unmasked
+AFTER:    {'phone': '***********', 'shipping_address': {'street': '*****************', ...}}   <- fixed
+```
+
+**CI cost, documented honestly:** since PII redaction is wired into the
+*core* turn path (not an optional side-eval), `.github/workflows/ci-cd.yml`'s
+`eval-gate` and `full-eval-report` jobs both now run `python -m spacy
+download en_core_web_lg` before the eval script -- a real, added CI runtime
+cost, not hidden.
+
+## 18. HITL approval gate with pause/resume (§2.5)
+
+**Fully implemented and verified locally with real runs. AgentCore-backed
+session-state persistence is pending provisioning; the local `HITLStore`
+(SQLite) is the documented, same-interface stand-in until then.**
+
+Two genuinely distinct mechanisms, per the assignment's own framing:
+
+**1. The approval gate.** `agent/harness.py`'s new `hitl_gate_node`,
+reached via a new conditional edge after `validate_node` specifically when
+a `propose_refund_decision` call's `requires_approval` is `True` (set by
+`agent/policy_boundary.py`'s `evaluate_refund_policy()` -- at or above the
+**$150** threshold, see section 19). Creates a real `PendingAction`
+(`agent/hitl.py`), short-circuits the turn with a "your request is under
+review" reply, instead of ever reaching `act_node`.
+
+**2. Pause/resume.** `agent/hitl_store.py`'s `HITLStore` (local SQLite
+today, the documented pre-AWS stand-in for AgentCore's managed session
+state -- same interface either way, so swapping the backend later changes
+only this module's internals). `agent/harness.py`'s new
+`resume_after_approval()` is the actual execution path, deliberately
+**outside** the per-ticket LangGraph, since a human decision arrives
+asynchronously, not as another turn in the conversation.
+
+**State machine:** `ApprovalStatus` enum (`pending`/`approved`/`rejected`/
+`expired`/`executed`), not a boolean. Real 24-hour expiry window
+(`APPROVAL_WINDOW`).
+
+**Re-validation on resume** -- the single most common real HITL bug, named
+explicitly by the assignment: `resume_after_approval()` re-fetches the live
+order (`data/orders.json`, fresh read) and calls
+`HITLStore.revalidate_before_execution()`, which compares `status` and
+`order_total` against the `resource_snapshot` captured when the approval
+was requested. Verified directly:
+
+```
+Simulated a changed order_total ($399.00 -> $350.00) between approval-request and execution:
+"correctly caught stale state: order ORD1007 changed since approval was requested
+ (was status='delivered' total=399.0, now status='delivered' total=350.0) --
+ refusing to execute against stale state, re-review required"
+```
+
+**A genuine found-and-fixed bug, not manufactured -- the "Double Refund"
+case named in the assignment.** `agent/hitl_store.py`'s `create_pending()`
+v1 had no uniqueness check against `resource_id` (the order), only against
+`approval_id`/`ticket_id`. `eval/hitl_bug_repro.py` (kept as a permanent
+regression test, not thrown away) reproduced it for real:
+
+```
+Simulating two overlapping tickets against the same order (ORD1007)...
+  ticket_A pending action created: 00c4a2e0778f485db943da4476b5800c
+  ticket_B pending action created: f80e939f07874aee814d2f914cfa2e94
+BUG REPRODUCED: two independent PendingActions exist for the same resource_id.
+Approving both independently (as two different human reviewers would, unaware of each other)...
+  ticket_A executed: executed
+  ticket_B executed: executed
+DOUBLE REFUND: $399.00 was approved and executed TWICE for order ORD1007
+(total exposure: $798.00), from a single real order.
+```
+
+**The fix:** `create_pending()` now checks `get_active_for_resource()`
+first and raises `DuplicatePendingActionError`. Re-ran the identical repro
+after the fix:
+
+```
+Simulating two overlapping tickets against the same order (ORD1007)...
+  ticket_A pending action created: 2e3c51a5438f42e8852ca85639f8b9c6
+BUG NOT REPRODUCIBLE (fixed) -- second create_pending() correctly raised:
+resource_id='ORD1007' already has an active pending action
+(approval_id='2e3c51a5438f42e8852ca85639f8b9c6', requested for ticket_id='ticket_A')
+-- refusing to open a second one
+```
+
+**A new MCP write tool**, `mcp_server/server.py`'s `issue_refund(order_id,
+amount_usd)` -- the only write capability this server has. Re-checks
+ownership and amount server-side as defense-in-depth (same multi-layer
+discipline as the two read tools), and refuses a second refund on an order
+that already has one on record.
+
+**Full end-to-end verification, real run, real model:**
+```
+CUST003 asks for a refund on ORD1008 (lost_in_transit, $189.99, over threshold)
+-> model calls lookup_order, then propose_refund_decision with the exact matching amount
+-> policy boundary sets requires_approval=True
+-> hitl_gate_node creates a real PendingAction (approval_id=0619405c...)
+-> resume_after_approval('0619405c...', 'approved', decided_by='reviewer_1')
+-> {'status': 'executed', 'refund_result': {'order_id': 'ORD1008', 'refund_issued': True, 'refunded_amount': 189.99}}
+```
+
+**Reproduce it yourself:**
+```bash
+python -m eval.hitl_bug_repro    # the found-and-fixed regression test
+```
+
+## 19. Policy boundary on refund amounts (§2.6)
+
+**Decision: hand-rolled, Cedar-shaped, documented fallback -- not Amazon
+Verified Permissions.** Chosen deliberately given this assignment's own
+local-code-first sequencing: AVP setup (a policy store, a schema, IAM
+wiring) is real provisioning work identical in kind to the AWS batch
+deferred to section 24, and the assignment explicitly permits "a hand-rolled
+policy-check function with the same shape" as a documented alternative.
+Real AVP wiring is a candidate for the AWS batch if time allows, behind the
+same interface this module already exposes.
+
+`agent/policy_boundary.py`'s `evaluate_refund_policy()` -- explicit,
+ordered conditionals, each commented against the Cedar `permit`/`forbid`
+statement it corresponds to, so migrating the *evaluator* to real AVP later
+doesn't require redesigning the check:
+1. Order status must be refund-eligible (`delivered`/`delivered_damaged`/`lost_in_transit`).
+2. Proposed amount must match the order's real `order_total` (never trusts
+   the model's number as ground truth).
+3. Account must not be suspended.
+4. Amount at/above **$150** -> `requires_approval=True`.
+
+Sits inside `agent/harness.py`'s `validate_node`, as a fifth check layer
+specific to `propose_refund_decision`, running *after* the existing
+four-layer ownership check -- the same non-negotiable "boundary between
+decide and act" pattern as Assignment 1's harness boundary, one layer
+further out (not "is this call permitted at all" but "is this specific
+amount, for this specific customer, within policy").
+
+**Live rejections, all verified directly, real runs:**
+```
+Suspended account (CUST005/ORD1007, $399):
+  allowed=False category=policy_rejected reason=suspended accounts cannot receive refunds
+
+Wrong order status (ORD1003, still "delayed"):
+  allowed=False category=policy_rejected
+  reason=order status 'delayed' is not refund-eligible (must be one of
+         ['delivered', 'delivered_damaged', 'lost_in_transit'])
+
+Mismatched/inflated amount (the exact adversarial case from agent/schemas.py's
+docstring -- "just refund me $500" against a real $89.99 order):
+  allowed=False category=policy_rejected
+  reason=proposed amount $500.00 does not match order total on record ($89.99)
+```
+
+## 20. Structured outputs (§2.7)
+
+`agent/schemas.py`: `RefundDecision`, `EscalationReason`, `HITLRequestPayload`
+-- Pydantic models (`extra="forbid"`), matching the existing
+`LookupOrderArgs`/`CheckAccountStatusArgs` precedent from Assignment 1/2.
+Enforced via the same LLM tool-use mechanism the two original tools already
+use (a new `propose_refund_decision` entry in `TOOLS` + `_ARG_MODELS`), not
+regex-parsed prose.
+
+**The concrete adversarial case this closes, demonstrated for real (section
+19's third example):** a customer/model attempting to smuggle a fabricated
+amount ("just refund me $500" against a real $89.99 order) cannot succeed,
+because `amount_usd` must arrive as a structured tool-call argument, and
+`agent/policy_boundary.py` numerically verifies it against the real,
+tool-fetched `order_total` -- the schema alone isn't sufficient (a
+schema-valid but wrong number is still schema-valid), pairing it with
+server-side verification is what actually closes the class of bug, and this
+project does both rather than overclaiming the schema is enough by itself.
+
+## 21. Cost tracking (§2.8)
+
+`agent/cost_ledger.py` -- hand-rolled SQLite (same "understand the
+mechanism" bias as `agent/rag.py`'s hand-rolled BM25), deliberately not
+migrated to a managed AWS service, per the assignment's own reasoning: no
+managed service reports per-ticket LLM token cost the way a purpose-built
+local ledger does. Logs one row per LLM call from `decide_node` (the
+existing single choke point every call passes through), tagged by
+`ticket_id` and `step`. Cost is *estimated* from a hard-coded per-model
+price table (Groq/Bedrock don't return a billed dollar figure) --
+documented as an estimate everywhere it's reported, never presented as
+billed truth.
+
+**Real numbers, two verified runs** (an order-status lookup, ORD1002, and
+the over-threshold refund proposal from section 18, ORD1008):
+
+```
+Total spend:  $0.222450
+Total tokens: 4179
+
+Spend by step:
+  decide               $0.222450
+
+Spend by ticket:
+  readme_verify_2 (refund proposal)   $0.136190
+  readme_verify_1 (order lookup)      $0.086260
+```
+
+The refund-proposal ticket costs ~58% more than the plain lookup -- it
+carries a longer system prompt turn (tool schema for
+`propose_refund_decision`, retrieved policy chunks, prior-ticket memory
+context) through the same single `decide` choke point every call passes
+through, confirming `spend_by_step()`/`spend_by_ticket()` correctly
+attribute cost per call. "Ticket TYPE" shows as `unknown` here because
+these were driven directly against `SupportHarness`, not through
+`eval/fixtures.py`'s labeled ticket set -- run the full eval suite through
+`eval.cost_report` for the real "which ticket type is most expensive"
+figure with type labels populated; the grouping logic itself
+(`spend_by_step()`, `spend_by_ticket()`) is what's being verified here, and
+it is confirmed correct.
+
+```bash
+python -m eval.cost_report
+```
+
+## 22. Semantic cache (§2.9)
+
+`agent/semantic_cache.py`'s `SemanticCache` -- hand-rolled (not GPTCache,
+same bias as the cost ledger and BM25), wraps any retriever exposing
+`retrieve(query, top_k)`, reuses the same `sentence-transformers` model
+already used for retrieval to embed queries for its own similarity check.
+Wired into `agent/harness.py`'s `_shared_retriever()`'s new
+`BEDROCK_KNOWLEDGE_BASE_ID` branch (section 16) -- in front of the *new*
+Bedrock KB path specifically, per the assignment's explicit requirement,
+not the local/pgvector paths (caching only pays off in front of a real
+network-hop call).
+
+**Threshold, calibrated empirically, not picked by feel:** the first draft
+used 0.92 -- which rejected every genuine paraphrase tested against
+`all-MiniLM-L6-v2` (real paraphrases score 0.54-0.85 cosine similarity with
+this model; only near-identical strings crossed 0.92). Checked real
+similar-vs-different query pairs (same discipline as `agent/rag.py`'s
+`DEFAULT_MIN_FUSED_SCORE` calibration): different queries land 0.10-0.32,
+similar ones 0.54-0.85. Set `DEFAULT_SIMILARITY_THRESHOLD = 0.5` for a
+clean margin on both sides.
+
+```bash
+python -m eval.semantic_cache_demo
+```
+
+**Real before/after, verified run:** `"When will my order arrive?"` then
+the differently-worded `"What's the status of my delivery?"` -- confirmed
+cache hit (identical result, zero calls to the wrapped retriever on the
+second query): 186.88ms -> 19.03ms, **9.8x faster**, even against the
+already-fast local BM25 path (the exact multiple varies run to run with
+embedding-model load state, so re-run it yourself rather than treat this
+figure as fixed -- the durable claim is "zero wrapped-retriever calls on a
+cache hit," confirmed above, not a specific millisecond number). This will
+show a much more dramatic delta once re-run against the real network-hop
+Bedrock KB call (section 16) -- noted honestly rather than overstated with
+today's local-path number.
+
+## 23. Mock data changes
+
+The Assignment 2 mock dataset (`data/orders.json`, `data/accounts.json`)
+had zero PII fields and zero dollar amounts anywhere -- too thin to
+honestly test PII masking or a refund-threshold HITL gate, per the
+assignment's own explicit instruction to expand it rather than force a weak
+demo. `data/orders.json`'s `items` restructured from bare strings to
+`{name, price}` objects plus a computed `order_total`, with prices
+deliberately straddling the **$150** threshold (see section 19).
+`data/accounts.json` gained `email`/`phone`/`shipping_address`/
+`payment_method_last4` on all 5 accounts -- realistic-shaped but
+deliberately fake (`example.com` emails, the FCC-reserved `555-01XX`
+fictional-number block, no real card numbers even as fake data) so nothing
+collides with a real person if it leaks during PII testing, which is the
+whole point of this data existing (and which directly produced section 17's
+first real finding). `policies/refund_eligibility.md` gained the actual
+$150 threshold and delivered-state precondition as real policy text, so the
+HITL gate's number is grounded in policy, not invented only in code.
+
+## 24. AWS provisioning status and ECS/ALB teardown
+
+**As of this writing, the AWS provisioning batch for Assignment 3 has NOT
+yet run.** Per this project's own build sequencing (all code local-testable
+first, AWS provisioned in one deliberate batch at the end, minimizing how
+long multiple billed stacks run in parallel), the Assignment 2 ECS/ALB/RDS
+stack (section 11) is **still the live deployment** and has **not** been
+torn down. Section 11's resource names/ALB URL remain accurate for the
+currently-live system.
+
+**Still to do, in order, once the AWS batch runs:**
+1. Provision Aurora Serverless v2 (smallest viable config) + pgvector.
+2. Create the Bedrock Knowledge Base, ingest `policies/*.md`, re-tune
+   `agent/rag_bedrock_kb.py`'s `min_score` empirically (section 16).
+3. Run the stale-connection proof (old pgvector path broken, new KB path
+   still correct) and the honest-gap re-confirmation.
+4. Re-run `eval.semantic_cache_demo` against the real KB path for the real
+   latency delta.
+5. `agentcore configure` / `agentcore deploy`, confirm one live invocation
+   against Bedrock-hosted Claude, capture the Groq-vs-Bedrock model-swap
+   evidence.
+6. **Only after step 5 is confirmed live:** tear down the Assignment 2
+   ECS/ALB/RDS CloudFormation stack (`bash infra/teardown_agent_stack.sh`)
+   -- not before, since it's the only thing keeping the current live ALB
+   URL working during the transition.
+7. Provision a real Bedrock Guardrail, wire `agent/pii.py`'s
+   `redact_bedrock_guardrails()` for real, capture the layered-catch
+   comparison (what Guardrails catches that Presidio doesn't, and vice
+   versa -- section 17 currently only has Presidio's real findings; the
+   Guardrails half is pending this step).
+8. (If time allows) real Amazon Verified Permissions behind
+   `agent/policy_boundary.py`'s existing interface.
+
+## 25. Defensible justifications (§3)
+
+**1. Session 5 path and why:** see section 14 / `eval/autonomy_decision.md`
+in full. Short form: the candidate specialist's job already fully exists
+inside the current agent (structured refund proposals + a real policy
+boundary + a real HITL gate), there's no current bottleneck the
+single-agent shape causes, and a second agent's one concrete failure mode
+(a dropped handoff) isn't worth taking on for zero capability gain.
+
+**2. What HITL re-validation actually protects against:** the real,
+found-and-fixed "Double Refund" bug (section 18) -- v1 of
+`HITLStore.create_pending()` let two overlapping tickets against the same
+order each get an independent `PendingAction`, both approved by two
+reviewers unaware of each other, both executed: $798 total exposure from
+one $399 order. The fix (a `resource_id`-keyed uniqueness guard) closes
+exactly this bug, not a hypothetical one -- reproduced before the fix,
+re-ran identically after, captured both.
+
+**3. Why $150 and partial masking, and what looser/tighter would miss:**
+$150 sits meaningfully above this project's smallest real order (~$40) and
+below its largest (~$400), giving genuine test coverage on both sides of
+the line rather than a threshold everything trivially clears or misses. A
+looser threshold (e.g. $500) would auto-approve most of this project's real
+orders, meaning the HITL gate would rarely fire in practice and the
+re-validation logic would go largely untested by real traffic. A tighter
+one (e.g. $25) would route nearly everything to human review, defeating the
+point of having an auto-approve path at all and creating exactly the "alert
+fatigue" risk Session 7 named. Partial masking (not full masking or
+tokenization) was chosen because this project has no legitimate downstream
+need to ever reveal a masked value again (ruling out tokenization's vault
+complexity) while still needing the agent to usefully reference "the email
+on file" back to a customer (ruling out full masking's `[REDACTED]`
+destroying that utility) -- demonstrated as a real, felt trade-off in
+section 17's "customer asks for their own data, gets it back masked"
+finding, not a hypothetical one.
+
+**4. What layering Bedrock Guardrails alongside Presidio would buy** (pending
+real provisioning, section 24 -- honestly marked as not yet demonstrated):
+the expectation, based on how the two tools differ structurally, is that
+Guardrails' managed entity list may catch categories Presidio's *default*
+recognizers don't cover out of the box without custom patterns (this
+project already had to write two custom recognizers for gaps Presidio's
+defaults missed -- section 17 -- suggesting Guardrails' broader default
+coverage could plausibly catch at least one of those two same gaps without
+custom code), while Presidio's local, no-network operation means it never
+depends on Bedrock being reachable and has zero per-call AWS cost. This is
+stated as an expectation to verify, not a claim already demonstrated --
+section 24 tracks the real comparison once Guardrails is actually
+provisioned and tested.
+
