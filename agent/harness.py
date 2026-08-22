@@ -68,11 +68,12 @@ from agent.hitl import ApprovalStatus, DuplicatePendingActionError, new_pending_
 from agent.hitl_store import HITLStore
 from agent.memory import LongTermMemory, ShortTermMemory
 from agent.mcp_client import MCPToolClient
+from agent.pii import redact_presidio
 from agent.policy_boundary import evaluate_refund_policy
 from agent.provider import GroqProvider
 from agent.rag import HybridPolicyRetriever
 from agent.schemas import RefundDecision
-from agent.tracing import langfuse, observe
+from agent.tracing import langfuse, observe, safe_span_payload
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 MAX_TOOL_ITERATIONS = 6
@@ -306,8 +307,8 @@ async def classify_node(state: TurnState, config: RunnableConfig) -> dict:
     ticket_type = classify_ticket(_latest_user_text(state["messages"]))
     print(f"[CLASSIFY] ticket_type={ticket_type}")
     langfuse.update_current_span(
-        input={"message": _latest_user_text(state["messages"])},
-        output={"ticket_type": ticket_type},
+        input=safe_span_payload({"message": _latest_user_text(state["messages"])}),
+        output=safe_span_payload({"ticket_type": ticket_type}),
     )
     return {"ticket_type": ticket_type}
 
@@ -322,7 +323,7 @@ async def retrieve_node(state: TurnState, config: RunnableConfig) -> dict:
     escalation reply full of unrelated words) can outweigh and misrank a
     perfectly well-formed new question that would have retrieved correctly
     on its own."""
-    langfuse.update_current_span(input={"query": _latest_user_text(state["messages"])})
+    langfuse.update_current_span(input=safe_span_payload({"query": _latest_user_text(state["messages"])}))
     harness = _get_harness(config)
 
     if harness.regressed:
@@ -419,8 +420,16 @@ async def decide_node(state: TurnState, config: RunnableConfig) -> dict:
         latency_s=latency_s,
     )
     langfuse.update_current_generation(
-        input=state["messages"],
-        output={"text": result["text"], "tool_calls": [tc["name"] for tc in result["tool_calls"]]},
+        # This is the real, found PII leak (see agent/pii.py and the
+        # README's PII section): state["messages"] is the FULL message
+        # history, including any tool RESULT already appended by act_node
+        # (e.g. check_account_status's raw account dict) -- redacting only
+        # the final customer-facing reply (handle_turn) never touches
+        # this, since a tool result is never itself the final reply.
+        # safe_span_payload() closes it here, structurally, rather than
+        # patching this one call site's symptom.
+        input=safe_span_payload(state["messages"]),
+        output=safe_span_payload({"text": result["text"], "tool_calls": [tc["name"] for tc in result["tool_calls"]]}),
         model=harness.provider.model,
         usage_details=result.get("usage"),
     )
@@ -830,7 +839,14 @@ class SupportHarness:
         # Persist the whole turn (user message, any tool round trips, final
         # answer) back into the conversation buffer for the next turn.
         self.short_term.messages = final_state["messages"]
-        final_text = final_state["final_text"] or ""
+        raw_final_text = final_state["final_text"] or ""
+        # PII enforcement point #1 (see agent/pii.py's module docstring):
+        # the customer-facing reply, redacted unconditionally as the
+        # conservative default -- a real, documented UX cost (the agent
+        # can't recite a customer's own email back verbatim even when that
+        # would be legitimately useful for a confirmation), traded for
+        # never being the one to leak it.
+        final_text = redact_presidio(raw_final_text).redacted_text
         self.last_retrieved_doc_ids = final_state.get("retrieved_doc_ids", [])
 
         langfuse.update_current_span(

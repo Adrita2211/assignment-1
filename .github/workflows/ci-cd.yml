@@ -41,6 +41,12 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
+      # agent/pii.py's Presidio layer needs this model; not pip-installable
+      # as a normal package, needs spaCy's own CLI download step. This adds
+      # real time to every gate run (a real, honestly-documented CI cost of
+      # wiring PII redaction into the core harness path rather than an
+      # optional side-eval) -- see README's PII section.
+      - run: python -m spacy download en_core_web_lg
       - name: Generate full evaluation report
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
@@ -61,6 +67,12 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
+      # agent/pii.py's Presidio layer needs this model; not pip-installable
+      # as a normal package, needs spaCy's own CLI download step. This adds
+      # real time to every gate run (a real, honestly-documented CI cost of
+      # wiring PII redaction into the core harness path rather than an
+      # optional side-eval) -- see README's PII section.
+      - run: python -m spacy download en_core_web_lg
       - name: Run trajectory-eval regression gate
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}

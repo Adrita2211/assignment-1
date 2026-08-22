@@ -26,4 +26,18 @@ if not os.environ.get("LANGFUSE_PUBLIC_KEY"):
 
 langfuse = get_client()
 
-__all__ = ["langfuse", "observe"]
+
+def safe_span_payload(payload: dict | list):
+    """PII enforcement point #3 (see agent/pii.py's module docstring): a
+    trace store is a data store, full stop -- redact every string value in
+    a span's input/output dict before it reaches update_current_span/
+    update_current_generation, same as any other PII exit point. Imported
+    lazily (not at module top level) to avoid Presidio/spaCy's real
+    startup cost for every process that imports agent.tracing but never
+    actually traces PII-bearing content (e.g. a pure eval-gate run)."""
+    from agent.pii import redact_value
+
+    return redact_value(payload)
+
+
+__all__ = ["langfuse", "observe", "safe_span_payload"]
