@@ -729,8 +729,9 @@ handoff, real tool calls documented in the file.
 
 ## 15. Bedrock AgentCore migration (§2.2)
 
-**Code status: complete and verified locally. AWS deployment: pending the
-provisioning batch (section 24).**
+**Actually deployed and live-invoked, not just code-complete.** The agent
+runs on a real AgentCore Runtime endpoint:
+`arn:aws:bedrock-agentcore:us-east-1:058264386876:runtime/ecommerce_support_agent-923Khb438X`.
 
 `agentcore_app.py` (repo root) wraps the existing `SupportHarness` in
 `BedrockAgentCoreApp` with a deliberately minimal `@app.entrypoint` --
@@ -765,41 +766,130 @@ that verification.
 / `dev` / `deploy`) is what actually provides the commands the assignment
 calls `configure`/`dev`/`launch` -- but the current CLI has **renamed
 `launch` to `deploy`** ("formerly 'launch'" per its own `--help` output),
-and the whole Python starter-toolkit is flagged as deprecated in favor of a
-new npm-based `@aws/agentcore` CLI (`npm install -g @aws/agentcore`). This
-was confirmed by actually installing `bedrock-agentcore==1.22.0` and
-`bedrock-agentcore-starter-toolkit==0.3.12` and inspecting them directly
-(`--help`, `inspect.signature`), not assumed. Whoever runs this next should
-re-check which CLI is current, since this is exactly the "fast-moving AWS
-product" the assignment itself warns about.
+and the CLI's own output actively recommends switching to a newer
+npm-based `@aws/agentcore` CLI. That newer CLI was actually tried and
+**does not run on this machine** -- `npx @aws/agentcore --help` crashes
+immediately with `SyntaxError: Invalid regular expression flags`, because
+its bundled JS uses a Unicode-property regex flag (`v`) that requires
+Node 20+, and this machine has Node 18.19.1. The deployment below used the
+Python starter-toolkit CLI for that reason -- a real, reproducible
+environment constraint, not a preference.
 
-**Real commands to reproduce** (Python starter-toolkit CLI, current as of
-this writing):
+**Two more real, live-discovered problems, both fixed before the
+deployment below succeeded:**
+- **`agentcore deploy` silently built the wrong entrypoint.** This repo
+  already had a `Dockerfile` at its root (Assignment 2's ECS image, `CMD
+  ["python", "server.py"]`). `agentcore configure` correctly generates its
+  *own* Dockerfile (targeting `agentcore_app.py`) into
+  `.bedrock_agentcore/<agent>/Dockerfile` -- but `agentcore deploy` still
+  picked up the pre-existing repo-root `Dockerfile` and built *that*
+  instead, deploying a container that ran the wrong app entirely (the
+  first live invoke failed with `GROQ_API_KEY is not set`, an error string
+  that only exists in `server.py`/`main.py`, not `agentcore_app.py` --
+  that's how this was caught). Fixed by renaming the ECS Dockerfile to
+  `Dockerfile.ecs` (and updating the one CI line that built it,
+  `.github/workflows/ci-cd.yml`), so the repo root no longer has a
+  same-named file for the CLI to ambiguously prefer.
+- **`ServiceQuotaExceededException: maxImageSizeMb limit exceeded`** on
+  the first real deploy attempt with the correct Dockerfile. The
+  auto-generated Dockerfile's plain `uv pip install -r requirements.txt`
+  pulls PyPI's default `torch` wheel, which bundles ~2GB of unused
+  CUDA/GPU libraries -- the exact problem the *legacy* ECS Dockerfile had
+  already solved by installing the CPU-only build from PyTorch's own
+  index first. Applying that same fix to the generated AgentCore
+  Dockerfile (plus a missing step: `en_core_web_lg`, required by
+  `agent/pii.py`'s Presidio layer, isn't pip-installable via
+  `requirements.txt` and needs its own download line) brought the image
+  from **3.25GB down to 948MB**, under the quota.
+
+**A real design pressure worth naming honestly:** the size fix required
+keeping the local Presidio/spaCy PII layer *in* the deployed image, at
+real image-size cost, rather than dropping it in favor of Bedrock
+Guardrails alone. That tradeoff was deliberate, not incidental --
+section 17 has live, bidirectional evidence that Presidio and Guardrails
+each catch real PII categories the other misses (a bank routing number
+Guardrails has no entity type for, versus phone/address patterns
+Presidio's un-customized defaults miss), so dropping either layer to save
+image size would have reopened a verified, real gap, not a hypothetical
+one.
+
+**Real commands used, in order** (Python starter-toolkit CLI):
 ```bash
 pip install bedrock-agentcore bedrock-agentcore-starter-toolkit
-agentcore configure --entrypoint agentcore_app.py
-agentcore dev              # local dev server with hot reload, no AWS needed
-agentcore deploy           # real AWS deploy (formerly `launch`)
+PYTHONIOENCODING=utf-8 agentcore configure --entrypoint agentcore_app.py \
+  --name ecommerce_support_agent --region us-east-1 --non-interactive --protocol HTTP
+agentcore deploy --auto-update-on-conflict \
+  --env LLM_PROVIDER=bedrock --env BEDROCK_MODEL_ID=amazon.nova-lite-v1:0 \
+  --env BEDROCK_KNOWLEDGE_BASE_ID=<kb-id> --env HITL_BACKEND=aurora \
+  --env COST_LEDGER_BACKEND=aurora --env POLICY_BOUNDARY_BACKEND=avp \
+  --env AURORA_CLUSTER_ARN=<arn> --env AURORA_SECRET_ARN=<arn> \
+  --env AURORA_DATABASE=kbdb --env AVP_POLICY_STORE_ID=<id>
 agentcore invoke '{"customer_id": "CUST002", "message": "Where is my order ORD1002?"}'
-agentcore destroy          # teardown
+agentcore destroy
 ```
 
-**Session-state honesty note (pending real verification):** AgentCore's
-managed session/memory support is expected to absorb multi-turn
-conversation-buffer persistence across invocations (replacing what
-`agent/memory.py`'s `ShortTermMemory` does by hand today). It is **not**
-expected to give the `PendingAction`/`ApprovalStatus` state machine
-(section 18) for free -- that logic (expiry, re-validation, the
-resource-keyed uniqueness guard) is hand-built regardless of backend;
-AgentCore would only absorb "where do the bytes durably live." This claim
-is written from the SDK's documented behavior and needs re-confirming
-against a real `agentcore dev` session before being treated as verified
-fact -- flagged here explicitly rather than silently asserted either way.
+**`PYTHONIOENCODING=utf-8` is required on Windows**, another real,
+reproducible finding: `agentcore configure`/`deploy`/`invoke` crash with
+`UnicodeEncodeError` under the default `cp1252` console encoding the
+moment they try to print a checkmark or emoji, and `agentcore configure`
+(without `--non-interactive`) separately crashes with
+`NoConsoleScreenBufferError` when run from this environment's shell
+(neither Git Bash nor a piped PowerShell session presents a real Win32
+console buffer to `prompt_toolkit`) -- `--non-interactive` avoids that
+second crash entirely.
+
+**`--env` flags apply at the AgentCore Runtime resource level**, confirmed
+by reading the deployed resource back with
+`aws bedrock-agentcore-control get-agent-runtime` -- its
+`environmentVariables` block showed every `--env` value correctly, even
+though neither `agentcore deploy`'s own console output nor the local
+`.bedrock_agentcore.yaml` config file ever mentions them.
+
+**`_make_llm_provider()` (`agent/harness.py`) is a fix this deployment
+attempt itself found necessary**, not planned in advance:
+`agentcore_app.py`'s `invoke()` never passed a `provider=` argument to
+`SupportHarness`, so the constructor fell through to `GroqProvider()`
+unconditionally -- meaning the real AgentCore deployment would always try
+to call Groq (no `GROQ_API_KEY` in that environment) regardless of the
+`LLM_PROVIDER` env var, silently defeating the entire migration this
+section is about. `LLM_PROVIDER=bedrock` now selects `BedrockProvider`
+(`amazon.nova-lite-v1:0` -- see section 17's justification-4-equivalent
+note below for why Nova and not Claude), matching every other
+env-var-driven backend switch in this project.
+
+**Session-state honesty note, now genuinely verified, not just expected:**
+`agentcore configure` auto-provisioned a real AgentCore Memory resource
+(`ecommerce_support_agent_mem-...`, `STM_ONLY` mode, 30-day retention) as
+part of default configuration, and Observability (CloudWatch Logs + X-Ray
+traces) auto-enabled on deploy too -- both confirmed from real deploy
+output, not assumed. Neither gives the `PendingAction`/`ApprovalStatus`
+state machine (section 18) for free, though -- that logic (expiry,
+re-validation, the resource-keyed uniqueness guard) is still hand-built
+regardless of backend, now on Aurora (section 18) rather than AgentCore's
+own Memory API, since Memory is conversation-context-shaped, not a
+business-workflow-approval-state primitive.
+
+**HITL pause/resume is reachable through the same deployed endpoint**, not
+just as a local Python call -- `agentcore_app.py`'s `invoke()` dispatches
+on `payload["action"] == "resume_approval"` to call
+`resume_after_approval()` directly, required by the assignment's "live and
+demonstrable" standard for section 18's HITL gate specifically. Verified
+live end-to-end: `agentcore invoke` created a real pending approval via
+the normal chat path, then a second `agentcore invoke '{"action":
+"resume_approval", ...}'` call against the same deployed endpoint
+approved and executed it (see section 18 for the full transcript).
 
 ## 16. Bedrock Knowledge Base migration (§2.3)
 
-**Code status: complete and verified locally with a mocked client. AWS
-deployment: pending the provisioning batch (section 24).**
+**Actually provisioned and serving live retrieval, not just mock-verified.**
+`infra/create_kb_aurora.sh` captures the exact real provisioning sequence
+used. Ingestion job against this project's real `policies/*.md` completed
+with `numberOfDocumentsScanned: 7, numberOfNewDocumentsIndexed: 7,
+numberOfDocumentsFailed: 0`. The deployed AgentCore endpoint (section 15)
+used this Knowledge Base for real retrieval in every live invocation
+during this session -- responses were correctly grounded in retrieved
+policy text (e.g. the `lost_in_transit` refund-eligibility case, section
+18), not fabricated.
 
 `agent/rag_bedrock_kb.py`'s `BedrockKBRetriever` replaces
 `agent/rag_pgvector.py`'s hand-rolled SQL query with the managed
@@ -830,14 +920,17 @@ held-out genuine-vs-adversarial query set the original threshold was
 calibrated against, once a real Knowledge Base exists to test against.
 **Not yet done** -- pending section 24's provisioning batch.
 
-**Still to verify for real, once provisioned (both required by the
-assignment, neither assumable):**
-- Prove the new path is genuinely serving traffic: temporarily point
-  `rag_pgvector.py`'s connection at an empty/truncated table and confirm
-  the old path breaks while `BedrockKBRetriever` still returns correct
-  results.
-- Re-confirm the honest-gap behavior (an off-topic question correctly
-  returns nothing) still holds after the migration and threshold re-tune.
+**Honestly still not done, flagged rather than skipped silently:** the
+empirical `min_score` recalibration against real Bedrock KB scores, and the
+stale-connection proof (pointing `rag_pgvector.py` at an empty table to
+confirm the old path breaks while the new one still works), were not
+completed before this session's Aurora cluster was torn down to stop
+billing (see section 24) -- there wasn't a specific real-score-vs-threshold
+mismatch observed in practice during live testing (retrieval visibly
+worked correctly on every live query), but "worked in the cases tried"
+isn't the same as an empirically re-tuned threshold. Both are real
+`infra/create_kb_aurora.sh`-reproducible next steps once Aurora is
+re-provisioned for the final demo.
 
 ## 17. PII detection and redaction, layered (§2.4)
 
@@ -1034,17 +1127,28 @@ ownership and amount server-side as defense-in-depth (same multi-layer
 discipline as the two read tools), and refuses a second refund on an order
 that already has one on record.
 
-**Full end-to-end verification, real run, real model:**
+**Full end-to-end verification against the real deployed AgentCore
+endpoint** (not just local Python) -- `agent/hitl_store_aurora.py`'s
+Postgres-partial-unique-index-backed store, live, via two separate
+`agentcore invoke` calls against the same running endpoint (section 15
+covers why `resume_approval` is reachable through that one endpoint at all):
+
 ```
-CUST003 asks for a refund on ORD1008 (lost_in_transit, $189.99, over threshold)
--> model calls lookup_order, then propose_refund_decision with the exact matching amount
--> policy boundary sets requires_approval=True
--> hitl_gate_node creates a real PendingAction (approval_id=0619405c...)
--> resume_after_approval('0619405c...', 'approved', decided_by='reviewer_1')
--> {'status': 'executed', 'refund_result': {'order_id': 'ORD1008', 'refund_issued': True, 'refunded_amount': 189.99}}
+$ agentcore invoke '{"customer_id": "CUST003", "message": "My graphic tablet
+  order ORD1008 never arrived, it says lost in transit. I want a refund."}'
+Response: Your refund request for order ORD1008 ($189.99) is above our review
+threshold and has been submitted for approval (reference: 944dd10c162c415d...).
+
+$ # confirmed in Aurora directly: hitl_pending_actions row, status='pending',
+$ # resource_id='ORD1008', amount_usd=189.99 -- real row, not asserted
+
+$ agentcore invoke '{"action": "resume_approval", "approval_id":
+  "944dd10c162c415db51b269ede8a6324", "decision": "approved", "decided_by": "reviewer_1"}'
+Response: {"status": "executed", "refund_result": {"order_id": "ORD1008",
+"refund_issued": true, "refunded_amount": 189.99}}
 ```
 
-**Reproduce it yourself:**
+**Reproduce the found-and-fixed bug yourself:**
 ```bash
 python -m eval.hitl_bug_repro    # the found-and-fixed regression test
 ```
@@ -1186,6 +1290,25 @@ it is confirmed correct.
 python -m eval.cost_report
 ```
 
+**Real numbers from the deployed AgentCore endpoint** (`agent/cost_ledger_aurora.py`,
+queried directly from Aurora after live invocations, `provider=bedrock`,
+`model=amazon.nova-lite-v1:0`):
+
+```
+ticket_id                        step    provider  model                 input  output  cost_usd
+8b554e23553c4e0cb153b7f6bf9e988e  decide  bedrock   amazon.nova-lite-v1:0  1623    117    0.000125
+8b554e23553c4e0cb153b7f6bf9e988e  decide  bedrock   amazon.nova-lite-v1:0  1455     60    0.000102
+```
+
+Real, live evidence for the Groq-vs-Bedrock model-swap cost comparison the
+assignment's own README section 9 (Assignment 2 cost benchmarking) already
+tracks: Nova Lite's per-call cost here (~$0.0001-0.0002) is roughly two
+orders of magnitude below Groq's `gpt-oss-120b` calls in section 21's
+earlier local numbers (~$0.06-0.09 each) -- not a controlled apples-to-apples
+comparison (different prompts, different call counts), but a real, directly
+observed order-of-magnitude difference worth naming rather than a projected
+one.
+
 ## 22. Semantic cache (§2.9)
 
 `agent/semantic_cache.py`'s `SemanticCache` -- hand-rolled (not GPTCache,
@@ -1244,36 +1367,53 @@ HITL gate's number is grounded in policy, not invented only in code.
 
 ## 24. AWS provisioning status and ECS/ALB teardown
 
-**As of this writing, the AWS provisioning batch for Assignment 3 has NOT
-yet run.** Per this project's own build sequencing (all code local-testable
-first, AWS provisioned in one deliberate batch at the end, minimizing how
-long multiple billed stacks run in parallel), the Assignment 2 ECS/ALB/RDS
-stack (section 11) is **still the live deployment** and has **not** been
-torn down. Section 11's resource names/ALB URL remain accurate for the
-currently-live system.
+**The AWS provisioning batch ran for real.** In order, all actually done
+and live-verified this session:
 
-**Still to do, in order, once the AWS batch runs:**
-1. Provision Aurora Serverless v2 (smallest viable config) + pgvector.
-2. Create the Bedrock Knowledge Base, ingest `policies/*.md`, re-tune
-   `agent/rag_bedrock_kb.py`'s `min_score` empirically (section 16).
-3. Run the stale-connection proof (old pgvector path broken, new KB path
-   still correct) and the honest-gap re-confirmation.
-4. Re-run `eval.semantic_cache_demo` against the real KB path for the real
-   latency delta.
-5. `agentcore configure` / `agentcore deploy`, confirm one live invocation
-   against Bedrock-hosted Claude, capture the Groq-vs-Bedrock model-swap
-   evidence.
-6. **Only after step 5 is confirmed live:** tear down the Assignment 2
-   ECS/ALB/RDS CloudFormation stack (`bash infra/teardown_agent_stack.sh`)
-   -- not before, since it's the only thing keeping the current live ALB
-   URL working during the transition.
-7. Provision a real Bedrock Guardrail, wire `agent/pii.py`'s
-   `redact_bedrock_guardrails()` for real, capture the layered-catch
-   comparison (what Guardrails catches that Presidio doesn't, and vice
-   versa -- section 17 currently only has Presidio's real findings; the
-   Guardrails half is pending this step).
-8. (If time allows) real Amazon Verified Permissions behind
-   `agent/policy_boundary.py`'s existing interface.
+1. ✅ Aurora Serverless v2 + pgvector provisioned (`infra/create_kb_aurora.sh`).
+2. ✅ Bedrock Knowledge Base created, all 7 `policies/*.md` docs ingested
+   successfully (section 16).
+3. ✅ Bedrock Guardrail provisioned and live-verified in both directions
+   against Presidio (section 17).
+4. ✅ Amazon Verified Permissions policy store, schema, and four Cedar
+   policies provisioned and live-verified across all four branches
+   (section 19).
+5. ✅ `agentcore configure` / `agentcore deploy`, real live invocations
+   confirmed against the deployed AgentCore Runtime endpoint, using
+   `amazon.nova-lite-v1:0` -- **not Claude**, a real, confirmed blocker:
+   this AWS account's Bedrock access to Claude models specifically fails
+   with `AccessDeniedException: Model access is denied due to
+   INVALID_PAYMENT_INSTRUMENT ... Your AWS Marketplace subscription for
+   this model cannot be completed`, retried repeatedly (4 attempts over 2
+   minutes, including after the account's payment method was updated) and
+   still failing, while Amazon-native models (Nova, Titan) work fine on
+   the same account -- an AWS Marketplace-specific billing issue, not a
+   Bedrock model-access issue in general. Documented rather than silently
+   worked around; `BEDROCK_MODEL_ID` is an env var specifically so
+   swapping back to a Claude model ID is a one-line config change once
+   that Marketplace subscription issue is resolved.
+6. ✅ HITL pause/resume and cost tracking verified live against the real
+   Aurora-backed store, through the deployed AgentCore endpoint itself
+   (section 18, section 21).
+7. **Not done, honestly flagged:** `agent/rag_bedrock_kb.py`'s `min_score`
+   empirical recalibration and the stale-connection proof (section 16),
+   and the Assignment 2 ECS/ALB/RDS CloudFormation stack teardown -- the
+   ECS stack is still live (section 11's resource names/ALB URL remain
+   accurate) and was deliberately **not** torn down yet, since full live
+   verification of every hardening piece wasn't complete when this
+   session's AWS budget/time ran out.
+
+**The Aurora cluster and Bedrock Knowledge Base were torn down at the end
+of this session** to stop the ACU-hour billing clock (Aurora Serverless v2
+does not scale to zero the way Serverless v1's auto-pause did -- it bills
+continuously at its configured minimum ACU whether or not it's handling
+traffic), per this project's "provision, verify, tear down" cost discipline.
+`infra/create_kb_aurora.sh` / `infra/teardown_kb_aurora.sh` make this
+reproducible for a final demo pass: re-run `create_kb_aurora.sh`, re-deploy
+AgentCore with the new resource ARNs, and everything above is
+re-verifiable from a clean state. The AgentCore Runtime deployment and the
+Verified Permissions policy store were left running (their idle cost is
+negligible compared to Aurora's continuous ACU billing).
 
 ## 25. Defensible justifications (§3)
 
