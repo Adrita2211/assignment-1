@@ -233,6 +233,35 @@ POLICY_DIR = Path(__file__).resolve().parent.parent / "policies"
 
 
 @lru_cache(maxsize=1)
+def _make_cost_ledger():
+    """COST_LEDGER_BACKEND=aurora selects the Aurora-backed ledger
+    (agent/cost_ledger_aurora.py, RDS Data API against the same Aurora
+    cluster the Bedrock Knowledge Base already provisions) -- required once
+    this runs on AgentCore Runtime, since local SQLite does not survive
+    between isolated, ephemeral invocations (confirmed against AWS's own
+    AgentCore Runtime docs). Defaults to local SQLite (agent/cost_ledger.py)
+    for local dev, same env-var-driven backend selection as
+    _shared_retriever() below."""
+    if os.environ.get("COST_LEDGER_BACKEND") == "aurora":
+        from agent.cost_ledger_aurora import CostLedgerAurora
+
+        return CostLedgerAurora()
+    return CostLedger()
+
+
+def _make_hitl_store():
+    """Same reasoning as _make_cost_ledger() above, for the HITL approval
+    state machine -- HITL_BACKEND=aurora selects agent/hitl_store_aurora.py,
+    the real requirement once deployed (Assignment 3 §2.5's "backed by
+    AgentCore's managed session state"), since a PendingAction that resets
+    on every invocation isn't actually a pending approval gate."""
+    if os.environ.get("HITL_BACKEND") == "aurora":
+        from agent.hitl_store_aurora import HITLStoreAurora
+
+        return HITLStoreAurora()
+    return HITLStore()
+
+
 def _shared_retriever():
     """The policy corpus never changes between tickets, so build the index
     and load the embedding model exactly once per process and reuse it
@@ -694,7 +723,7 @@ async def resume_after_approval(approval_id: str, decision: str, decided_by: str
     re-validation is the piece AgentCore's managed session state does NOT
     give you for free; only durable storage of the snapshot does.
     """
-    store = hitl_store or HITLStore()
+    store = hitl_store or _make_hitl_store()
     action = store.get(approval_id)
     if action is None:
         raise ValueError(f"No pending action with approval_id={approval_id!r}")
@@ -742,8 +771,8 @@ class SupportHarness:
         self.short_term = ShortTermMemory()
         self.audit_log: list[dict] = []
         self.metrics_log: list[dict] = []  # one entry per LLM call this turn -- see metrics()
-        self.cost_ledger = CostLedger()
-        self.hitl_store = HITLStore()
+        self.cost_ledger = _make_cost_ledger()
+        self.hitl_store = _make_hitl_store()
         self.last_trace_id: Optional[str] = None
         self.last_retrieved_doc_ids: list[str] = []
         # Per-instance, not a process-wide constant, so a single process (a

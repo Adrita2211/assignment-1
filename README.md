@@ -841,17 +841,20 @@ assignment, neither assumable):**
 
 ## 17. PII detection and redaction, layered (§2.4)
 
-**Fully implemented and verified locally -- the one Bedrock Guardrails half
-is deferred, everything else is real and tested.**
+**Fully implemented and verified live against a real, deployed Bedrock
+Guardrail -- no longer a deferred seam.**
 
 `agent/pii.py`: Microsoft Presidio (`AnalyzerEngine` + `AnonymizerEngine`,
-spaCy `en_core_web_lg`) as the local, always-on layer.
-`redact_bedrock_guardrails()` is a documented seam (raises
-`NotImplementedError` locally, same pattern as `BedrockProvider`'s
-Assignment-2-era stub) for AWS-managed Sensitive Information Filters via
-`ApplyGuardrail`, pending provisioning. `redact_layered()` **unions** both
-layers' findings rather than one replacing the other, per the assignment's
-explicit "these layer, they don't replace each other" requirement.
+spaCy `en_core_web_lg`) as the local, always-on layer, chained into a real
+`redact_bedrock_guardrails()` boto3 `bedrock-runtime.apply_guardrail()`
+call against a provisioned guardrail
+(`arn:aws:bedrock:us-east-1:058264386876:guardrail/8c3d1djf3a5a`, version
+1, `sensitiveInformationPolicyConfig` covering EMAIL/PHONE/NAME/ADDRESS/
+US_BANK_ACCOUNT_NUMBER/CREDIT_DEBIT_CARD_NUMBER/US_SOCIAL_SECURITY_NUMBER).
+`redact_layered()` runs Presidio first, then Guardrails against Presidio's
+own output -- **unioning** both layers' findings rather than one replacing
+the other, per the assignment's explicit "these layer, they don't replace
+each other" requirement.
 
 **Redaction strategy: partial masking**, not full masking or tokenization.
 Full masking (`[REDACTED]`) destroys the agent's ability to usefully
@@ -905,6 +908,46 @@ RAW:      {'phone': '+1-555-0142', 'shipping_address': {'street': '482 Birchwood
 BEFORE:   {'phone': '+1-555-0142', 'shipping_address': {'street': '482 Birchwood Ave', ...}}   <- unmasked
 AFTER:    {'phone': '***********', 'shipping_address': {'street': '*****************', ...}}   <- fixed
 ```
+
+**A third genuine found-and-fixed bug, more serious than the first two --
+this one was a redaction-execution bug, not a detection gap.**
+`_partial_mask_operators()` originally set `PERSON`/`LOCATION` to
+`chars_to_mask=6` on the theory that masking only the first few characters
+would leave a "recognizable but hidden" value. That's backwards: Presidio's
+`mask` operator masks exactly `chars_to_mask` characters from the START of
+the matched span and leaves the rest untouched -- so any name or location
+longer than 6 characters leaked everything past character 6, even though
+detection itself was correct. Verified directly:
+
+```
+Input:  "My name is Jordan Ellis and my account is CUST003, SSN 523-11-8842, ..."
+Detected span (correct): PERSON, offset 11-23, "Jordan Ellis" (full name)
+BEFORE fix: "My name is ****** Ellis and ..."   <- surname leaked in plain text
+AFTER fix:  "My name is ************ and ..."   <- fixed (chars_to_mask=100, full match)
+```
+
+**Guardrails vs. Presidio, tested live in both directions -- a real,
+bidirectional finding, not a one-way "Guardrails is strictly better"
+story:**
+
+- **Guardrails catches what Presidio's un-customized defaults miss**
+  (the original `555-01XX` phone / street-address gaps, section above) --
+  confirmed by running the *unmodified* input through a live
+  `ApplyGuardrail` call: both correctly detected and masked
+  (`{PHONE}`, `{ADDRESS}`).
+- **Presidio catches what Guardrails' fixed entity list misses.** Tested
+  live against `"...bank account 000123456789, routing number 021000021,
+  or my card 4242 4242 4242 4242."`:
+  ```
+  Presidio:   masks bank account AND routing number (US_BANK_NUMBER)
+  Guardrails: "...routing number 021000021, or my card {CREDIT_DEBIT_CARD_NUMBER}."
+              <- routing number left in PLAIN TEXT; Guardrails has no ABA
+                 routing-number entity type in its standard PII categories.
+  ```
+
+This is the concrete, live-verified justification for layering rather than
+picking one: neither tool's coverage is a superset of the other's, in
+either direction, on this project's own real data.
 
 **CI cost, documented honestly:** since PII redaction is wired into the
 *core* turn path (not an optional side-eval), `.github/workflows/ci-cd.yml`'s
@@ -1239,17 +1282,17 @@ destroying that utility) -- demonstrated as a real, felt trade-off in
 section 17's "customer asks for their own data, gets it back masked"
 finding, not a hypothetical one.
 
-**4. What layering Bedrock Guardrails alongside Presidio would buy** (pending
-real provisioning, section 24 -- honestly marked as not yet demonstrated):
-the expectation, based on how the two tools differ structurally, is that
-Guardrails' managed entity list may catch categories Presidio's *default*
-recognizers don't cover out of the box without custom patterns (this
-project already had to write two custom recognizers for gaps Presidio's
-defaults missed -- section 17 -- suggesting Guardrails' broader default
-coverage could plausibly catch at least one of those two same gaps without
-custom code), while Presidio's local, no-network operation means it never
-depends on Bedrock being reachable and has zero per-call AWS cost. This is
-stated as an expectation to verify, not a claim already demonstrated --
-section 24 tracks the real comparison once Guardrails is actually
-provisioned and tested.
+**4. What layering Bedrock Guardrails alongside Presidio actually buys,
+verified live in both directions (section 17):** Guardrails' managed
+entity list caught this project's original `555-01XX`/street-address gaps
+without any custom code, confirmed by running the unmodified input through
+a live `ApplyGuardrail` call. But the reverse is also true and just as
+real: Presidio caught a bank routing number that Guardrails' fixed entity
+list has no category for at all (`ApplyGuardrail` left `021000021` in
+plain text next to a correctly-masked card number). Neither tool's
+coverage is a superset of the other's on this project's own data --
+that's the actual, demonstrated case for layering, not a theoretical one.
+Presidio's local, no-network operation also means it never depends on
+Bedrock being reachable and has zero per-call AWS cost, which stays true
+regardless of the coverage comparison.
 

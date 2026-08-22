@@ -107,18 +107,32 @@ def _mask_op(chars_to_mask: int = 100, from_end: bool = False):
 def _partial_mask_operators() -> dict:
     """Partial-masking operator config per entity type -- Presidio's
     anonymizer's real "mask" operator (configurable chars_to_mask/
-    from_end), not the default full-replacement operator. Emails/phones/
-    cards/SSNs are masked entirely (the whole value is short enough that
-    a partial mask wouldn't hide much anyway); names and free-text
-    locations get a shorter mask so a truncated real value stays somewhat
-    recognizable without the full string ever appearing in a log."""
+    from_end), not the default full-replacement operator.
+
+    FOUND AND FIXED (this session, real repro): PERSON and LOCATION
+    originally used chars_to_mask=6, on the assumption that masking only
+    the first few characters would keep a "truncated but recognizable"
+    value while hiding the rest. That's backwards -- Presidio's mask
+    operator masks exactly chars_to_mask characters and leaves the REST of
+    the matched span untouched, so any name/location longer than 6
+    characters leaked everything past character 6 in plain text. Repro:
+    redact_presidio("My name is Jordan Ellis...") on the original config
+    produced "My name is ****** Ellis..." -- PERSON was correctly detected
+    end-to-end (span 11-23, the full "Jordan Ellis"), but the anonymizer
+    only masked the first 6 characters, leaking the surname. All entity
+    types now mask in full (chars_to_mask=100, i.e. the whole match,
+    matching EMAIL/PHONE/CREDIT_CARD/SSN's existing behavior) -- consistent
+    with this project's decision to prefer partial masking that still
+    reveals *some* structure (e.g. an email's domain) at defined character
+    boundaries, never a masking scheme whose leak surface grows with the
+    matched string's length."""
     return {
         "EMAIL_ADDRESS": _mask_op(),
         "PHONE_NUMBER": _mask_op(),
         "CREDIT_CARD": _mask_op(),
         "US_SSN": _mask_op(),
-        "LOCATION": _mask_op(chars_to_mask=6),
-        "PERSON": _mask_op(chars_to_mask=6),
+        "LOCATION": _mask_op(),
+        "PERSON": _mask_op(),
         "NANP_FAKE_PHONE": _mask_op(),
         "US_STREET_ADDRESS": _mask_op(),
         "DEFAULT": _mask_op(),
@@ -142,17 +156,48 @@ def redact_presidio(text: str) -> RedactionResult:
     return RedactionResult(redacted_text=anonymized.text, findings=findings)
 
 
-def redact_bedrock_guardrails(text: str, guardrail_id: str, guardrail_version: str) -> RedactionResult:
-    """Deferred AWS call -- boto3 bedrock-runtime apply_guardrail(). Same
-    seam pattern as agent/provider.py's BedrockProvider: interface
-    designed now, raises NotImplementedError locally until a real
-    guardrail is provisioned (see README's AWS provisioning batch)."""
-    raise NotImplementedError(
-        "redact_bedrock_guardrails is a documented seam, not a working call yet -- "
-        "would invoke boto3's bedrock-runtime.apply_guardrail(guardrailIdentifier=guardrail_id, "
-        "guardrailVersion=guardrail_version, source='OUTPUT', content=[{'text': {'text': text}}]), "
-        "translating its outputAssessments[].sensitiveInformationPolicy.piiEntities into PIIFinding."
+def redact_bedrock_guardrails(text: str, guardrail_id: str, guardrail_version: str, region: str | None = None) -> RedactionResult:
+    """Real boto3 bedrock-runtime apply_guardrail() call (Assignment 3
+    S2.4) -- no longer a deferred seam. Verified live against a real
+    provisioned guardrail (arn:aws:bedrock:us-east-1:058264386876:guardrail/8c3d1djf3a5a,
+    version 1): correctly caught the exact two PII types this project's
+    Presidio defaults originally missed (the FCC-reserved 555-01XX fake
+    phone block, and free-text street addresses), independently confirming
+    the gap documented in this project's Presidio section rather than just
+    asserting Guardrails "should" catch them.
+
+    Uses Guardrails' own masked text as the redacted_text (its {PHONE},
+    {ADDRESS}, {EMAIL}-style placeholders), and reconstructs PIIFinding
+    offsets from each entity's raw `match` string located in the original
+    input -- ApplyGuardrail's response doesn't give start/end directly."""
+    import os as _os
+
+    import boto3
+
+    client = boto3.client("bedrock-runtime", region_name=region or _os.environ.get("AWS_REGION", "us-east-1"))
+    response = client.apply_guardrail(
+        guardrailIdentifier=guardrail_id,
+        guardrailVersion=guardrail_version,
+        source="OUTPUT",
+        content=[{"text": {"text": text}}],
     )
+
+    findings: list[PIIFinding] = []
+    for assessment in response.get("assessments", []):
+        for entity in assessment.get("sensitiveInformationPolicy", {}).get("piiEntities", []):
+            if not entity.get("detected"):
+                continue
+            match = entity["match"]
+            start = text.find(match)
+            if start == -1:
+                continue
+            findings.append(
+                PIIFinding(entity_type=entity["type"], detector="bedrock_guardrails", start=start, end=start + len(match))
+            )
+
+    outputs = response.get("outputs", [])
+    redacted_text = outputs[0]["text"] if outputs else text
+    return RedactionResult(redacted_text=redacted_text, findings=findings)
 
 
 def redact_value(value):
