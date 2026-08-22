@@ -106,31 +106,149 @@ class GroqProvider(LLMProvider):
                 time.sleep(_rate_limit_wait_s(exc, attempt))
 
 
-class BedrockProvider(LLMProvider):
-    """Not implemented -- a code-shape exercise per the assignment's
-    optional §2.6.4, not a deployed endpoint. Documents exactly which call
-    would go here and which env var would select it, so the seam exists and
-    is reviewable without pretending it's functional.
+def _to_bedrock_messages(messages: list[dict]) -> tuple[str | None, list[dict]]:
+    """OpenAI-shaped messages -> Converse API's messages shape. Converse
+    takes the system prompt SEPARATELY (a `system` param, not a message
+    with role="system"), and every message's content is a list of typed
+    blocks ({"text": ...} / {"toolUse": ...} / {"toolResult": ...}), not a
+    bare string. Returns (system_text, converse_messages)."""
+    system_text = None
+    converse_messages = []
+    for m in messages:
+        if m["role"] == "system":
+            system_text = m["content"]
+            continue
+        if m["role"] == "tool":
+            # A tool RESULT -- Converse expects this as a "user" turn
+            # carrying a toolResult block, not its own role.
+            converse_messages.append({
+                "role": "user",
+                "content": [{
+                    "toolResult": {
+                        "toolUseId": m["tool_call_id"],
+                        "content": [{"text": m["content"]}],
+                    },
+                }],
+            })
+        elif m["role"] == "assistant" and m.get("tool_calls"):
+            content = []
+            if m.get("content"):
+                content.append({"text": m["content"]})
+            for tc in m["tool_calls"]:
+                content.append({
+                    "toolUse": {
+                        "toolUseId": tc["id"],
+                        "name": tc["function"]["name"],
+                        "input": json.loads(tc["function"]["arguments"]),
+                    },
+                })
+            converse_messages.append({"role": "assistant", "content": content})
+        else:
+            converse_messages.append({"role": m["role"], "content": [{"text": m["content"] or ""}]})
+    return system_text, converse_messages
 
-    Selected via LLM_PROVIDER=bedrock (see get_provider() below). When
-    implemented, `call()` would invoke the Bedrock Runtime `converse` API
-    (boto3 `bedrock-runtime` client's `converse()`, or the lower-level
-    `invoke_model()` for a model without Converse API support), translating
-    this project's OpenAI-style `messages`/`tools` into the Converse API's
-    `messages`/`toolConfig` shapes and translating the response back into
-    this class's {"text", "tool_calls"} normalized form -- the same
-    translation GroqProvider.call() already does for Groq's wire format.
+
+def _to_bedrock_tool_config(tools: list[dict]) -> dict:
+    """OpenAI-shaped tools ({"type": "function", "function": {...}}) ->
+    Converse's toolConfig shape ({"tools": [{"toolSpec": {...}}]}). The
+    JSON-schema `parameters` block is identical either way -- this is
+    genuinely just a wrapper-shape translation, not a schema rewrite,
+    which is exactly why agent/harness.py's TOOLS didn't need to change."""
+    return {
+        "tools": [
+            {
+                "toolSpec": {
+                    "name": t["function"]["name"],
+                    "description": t["function"]["description"],
+                    "inputSchema": {"json": t["function"]["parameters"]},
+                },
+            }
+            for t in tools
+        ],
+    }
+
+
+def _from_bedrock_response(response: dict) -> dict:
+    """Converse API response -> this project's normalized {"text",
+    "tool_calls", "usage"} shape, the same contract GroqProvider.call()
+    already returns."""
+    message = response["output"]["message"]
+    text_parts = []
+    tool_calls = []
+    for block in message.get("content", []):
+        if "text" in block:
+            text_parts.append(block["text"])
+        elif "toolUse" in block:
+            tu = block["toolUse"]
+            tool_calls.append({"id": tu["toolUseId"], "name": tu["name"], "arguments": tu["input"]})
+
+    usage = response.get("usage", {})
+    return {
+        "text": "\n".join(text_parts) if text_parts else None,
+        "tool_calls": tool_calls,
+        "usage": {
+            "input_tokens": usage.get("inputTokens", 0),
+            "output_tokens": usage.get("outputTokens", 0),
+        },
+    }
+
+
+class BedrockProvider(LLMProvider):
+    """Bedrock Runtime `converse()` API -- the AWS-managed path this
+    project's agent runs on once wrapped in agentcore_app.py's
+    BedrockAgentCoreApp (Assignment 3 §2.2). Selected via LLM_PROVIDER=bedrock
+    (see get_provider() below).
+
+    Local dev keeps using GroqProvider (LLM_PROVIDER unset/groq); this
+    class only activates with real AWS credentials configured, and needs
+    the target model actually enabled for this account in the Bedrock
+    console -- model access has real approval lead time for some models
+    (see this project's README for the exact model ID this deployment
+    uses and when it was confirmed enabled, since Bedrock model
+    availability changes per-account and isn't something to hardcode a
+    permanent default for here).
     """
 
-    def __init__(self, model: str | None = None):
-        self.model = model or os.environ.get("BEDROCK_MODEL_ID", "anthropic.claude-3-5-sonnet-20241022-v2:0")
+    def __init__(self, model: str | None = None, region: str | None = None):
+        self.model = model or os.environ.get(
+            "BEDROCK_MODEL_ID",
+            # A known-good, generally-available model ID as a last-resort
+            # fallback if BEDROCK_MODEL_ID isn't set -- NOT necessarily the
+            # model this deployment actually uses. Set BEDROCK_MODEL_ID
+            # explicitly to whatever this account's confirmed-enabled model
+            # ID is (check `aws bedrock list-foundation-models` or the
+            # console) rather than relying on this default.
+            "anthropic.claude-3-5-sonnet-20241022-v2:0",
+        )
+        self._region = region or os.environ.get("AWS_REGION", "us-east-1")
+        self._client = None
+
+    @property
+    def client(self):
+        # Lazy: importing boto3 and creating a client at construction time
+        # would make every BedrockProvider() instantiation (including ones
+        # created just to read .model, e.g. in tests) require real AWS
+        # credentials/network access even when call() is never invoked.
+        if self._client is None:
+            import boto3
+
+            self._client = boto3.client("bedrock-runtime", region_name=self._region)
+        return self._client
 
     def call(self, messages: list[dict], tools: list[dict] | None = None, max_tokens: int = 1024) -> dict:
-        raise NotImplementedError(
-            "BedrockProvider is a documented seam, not a working provider yet -- see this class's "
-            "docstring for the exact bedrock-runtime call it would make. When implemented, `usage` "
-            "would come from the converse() response's `usage.inputTokens` / `usage.outputTokens`."
+        system_text, converse_messages = _to_bedrock_messages(messages)
+        kwargs = dict(
+            modelId=self.model,
+            messages=converse_messages,
+            inferenceConfig={"maxTokens": max_tokens},
         )
+        if system_text:
+            kwargs["system"] = [{"text": system_text}]
+        if tools:
+            kwargs["toolConfig"] = _to_bedrock_tool_config(tools)
+
+        response = self.client.converse(**kwargs)
+        return _from_bedrock_response(response)
 
 
 def get_provider(name: str | None = None) -> LLMProvider:

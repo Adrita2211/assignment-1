@@ -239,11 +239,25 @@ def _shared_retriever():
     across every SupportHarness session, instead of paying that startup cost
     (most visibly, reloading the embedding model) on every single ticket.
 
-    Backend selection: DATABASE_URL set -> RDS PostgreSQL + pgvector
-    (agent/rag_pgvector.py), the required backend for the deployed agent
-    (see README's AWS architecture section). Unset -> the local FAISS+BM25
-    index (agent/rag.py), which keeps demo.py/main.py runnable with zero
-    external services for local development."""
+    Backend selection, checked in this order:
+      1. BEDROCK_KNOWLEDGE_BASE_ID set -> Bedrock Knowledge Bases
+         (agent/rag_bedrock_kb.py), the Assignment 3 target backend, wrapped
+         in agent/semantic_cache.py's SemanticCache since caching only pays
+         off in front of a real network-hop retrieval call. Checked first
+         since it's the direction this project is migrating toward.
+      2. DATABASE_URL set -> RDS/Aurora PostgreSQL + pgvector
+         (agent/rag_pgvector.py), the Assignment 2 backend, kept as a
+         documented fallback/dev path during the migration.
+      3. Neither set -> the local BM25 index (agent/rag.py), which keeps
+         demo.py/main.py runnable with zero external services for local
+         development.
+    """
+    kb_id = os.environ.get("BEDROCK_KNOWLEDGE_BASE_ID")
+    if kb_id:
+        from agent.rag_bedrock_kb import BedrockKBRetriever
+        from agent.semantic_cache import SemanticCache
+        return SemanticCache(BedrockKBRetriever(kb_id))
+
     database_url = os.environ.get("DATABASE_URL")
     if database_url:
         from agent.rag_pgvector import PgVectorPolicyRetriever
