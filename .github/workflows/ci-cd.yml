@@ -111,7 +111,7 @@ jobs:
           ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
         run: |
           IMAGE="$ECR_REGISTRY/${{ env.APP_NAME }}:${{ github.sha }}"
-          docker build -t "$IMAGE" .
+          docker build -f Dockerfile.ecs -t "$IMAGE" .
           docker push "$IMAGE"
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
 

@@ -31,7 +31,7 @@ import uuid
 
 from bedrock_agentcore import BedrockAgentCoreApp
 
-from agent.harness import SupportHarness
+from agent.harness import SupportHarness, resume_after_approval
 from agent.tracing import langfuse
 
 app = BedrockAgentCoreApp()
@@ -39,6 +39,23 @@ app = BedrockAgentCoreApp()
 
 @app.entrypoint
 async def invoke(payload: dict) -> dict:
+    """Two payload shapes, dispatched on the presence of "action" --
+    the ordinary chat turn (customer_id/message), and the HITL
+    pause/resume step (Assignment 3 SS2.5), which is deliberately NOT part
+    of a chat turn (see resume_after_approval's own docstring: a human
+    decision arrives asynchronously, not as another message in the
+    conversation). Both need to be reachable through the one deployed
+    AgentCore endpoint for the "live and demonstrable against your deployed
+    endpoint" requirement to actually cover HITL resume, not just the gate
+    that creates the pending action."""
+    if payload.get("action") == "resume_approval":
+        result = await resume_after_approval(
+            approval_id=payload["approval_id"],
+            decision=payload["decision"],
+            decided_by=payload.get("decided_by", "reviewer"),
+        )
+        return result
+
     customer_id = payload["customer_id"]
     message = payload["message"]
     ticket_id = payload.get("ticket_id") or uuid.uuid4().hex
