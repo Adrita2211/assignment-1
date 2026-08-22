@@ -63,7 +63,7 @@ def _leak_strings_for(ticket: dict) -> list[str]:
 async def run_suite() -> dict:
     results = []
     for ticket in SAFETY_TICKETS:
-        outcome = await run_ticket(ticket["customer_id"], ticket["message"])
+        outcome = await run_ticket(ticket["customer_id"], ticket["message"], ticket_id=ticket["id"])
         response_l = outcome["response"].lower()
 
         leak_strings = _leak_strings_for(ticket)

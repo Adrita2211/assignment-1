@@ -63,6 +63,7 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from agent.classify import classify_ticket
+from agent.cost_ledger import CostLedger
 from agent.memory import LongTermMemory, ShortTermMemory
 from agent.mcp_client import MCPToolClient
 from agent.provider import GroqProvider
@@ -341,13 +342,35 @@ async def decide_node(state: TurnState, config: RunnableConfig) -> dict:
         result = harness.provider.call([system_msg] + state["messages"], tools=TOOLS)
     except Exception as exc:
         harness.metrics_log.append({"latency_s": time.perf_counter() - t0, "error": str(exc)})
+        harness.cost_ledger.record(
+            ticket_id=harness.ticket_id,
+            step="decide",
+            provider=type(harness.provider).__name__.removesuffix("Provider").lower(),
+            model=harness.provider.model,
+            input_tokens=0,
+            output_tokens=0,
+            latency_s=time.perf_counter() - t0,
+            error=str(exc),
+        )
         raise
+    input_tokens = result.get("usage", {}).get("input_tokens", 0)
+    output_tokens = result.get("usage", {}).get("output_tokens", 0)
+    latency_s = time.perf_counter() - t0
     harness.metrics_log.append({
-        "latency_s": time.perf_counter() - t0,
-        "input_tokens": result.get("usage", {}).get("input_tokens", 0),
-        "output_tokens": result.get("usage", {}).get("output_tokens", 0),
+        "latency_s": latency_s,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
         "error": None,
     })
+    harness.cost_ledger.record(
+        ticket_id=harness.ticket_id,
+        step="decide",
+        provider=type(harness.provider).__name__.removesuffix("Provider").lower(),
+        model=harness.provider.model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        latency_s=latency_s,
+    )
     langfuse.update_current_generation(
         input=state["messages"],
         output={"text": result["text"], "tool_calls": [tc["name"] for tc in result["tool_calls"]]},
@@ -504,18 +527,26 @@ def _compiled_graph():
 
 
 class SupportHarness:
-    def __init__(self, customer_id: str, provider: GroqProvider | None = None, regressed: bool | None = None):
+    def __init__(
+        self,
+        customer_id: str,
+        provider: GroqProvider | None = None,
+        regressed: bool | None = None,
+        ticket_id: str = "unscoped",
+    ):
         accounts = json.loads((DATA_DIR / "accounts.json").read_text(encoding="utf-8"))
         if customer_id not in accounts:
             raise ValueError(f"Unknown customer_id {customer_id!r}; cannot open a session for it.")
 
         self.customer_id = customer_id
+        self.ticket_id = ticket_id
         self.provider = provider or GroqProvider()
         self.retriever = _shared_retriever()
         self.long_term = LongTermMemory(DATA_DIR / "ticket_history.json")
         self.short_term = ShortTermMemory()
         self.audit_log: list[dict] = []
         self.metrics_log: list[dict] = []  # one entry per LLM call this turn -- see metrics()
+        self.cost_ledger = CostLedger()
         self.last_trace_id: Optional[str] = None
         self.last_retrieved_doc_ids: list[str] = []
         # Per-instance, not a process-wide constant, so a single process (a

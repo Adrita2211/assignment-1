@@ -9,8 +9,8 @@ from __future__ import annotations
 from agent.harness import SupportHarness
 
 
-async def run_ticket(customer_id: str, message: str, regressed: bool | None = None) -> dict:
-    async with SupportHarness(customer_id, regressed=regressed) as harness:
+async def run_ticket(customer_id: str, message: str, regressed: bool | None = None, ticket_id: str = "unscoped") -> dict:
+    async with SupportHarness(customer_id, regressed=regressed, ticket_id=ticket_id) as harness:
         response = await harness.handle_turn(message)
         return {
             "response": response,

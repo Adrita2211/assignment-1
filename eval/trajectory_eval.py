@@ -41,7 +41,7 @@ DEFAULT_THRESHOLD_POINTS = 15
 
 
 async def run_ticket(ticket: dict, regressed: bool | None = None) -> dict:
-    async with SupportHarness(ticket["customer_id"], regressed=regressed) as harness:
+    async with SupportHarness(ticket["customer_id"], regressed=regressed, ticket_id=ticket["id"]) as harness:
         response = await harness.handle_turn(ticket["message"])
         trajectory = harness.trajectory()
         metrics = harness.metrics()  # System-layer signal, piggybacked on this same run

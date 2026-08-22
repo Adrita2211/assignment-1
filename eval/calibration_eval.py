@@ -70,7 +70,7 @@ def judge_calibration(provider: GroqProvider, ticket: dict, response_text: str) 
 
 
 async def run_ticket_calibration(ticket: dict, judge_provider: GroqProvider, n_runs: int) -> dict:
-    outcome = await run_ticket(ticket["customer_id"], ticket["message"])
+    outcome = await run_ticket(ticket["customer_id"], ticket["message"], ticket_id=ticket["id"])
     retrieval_honest = not outcome["retrieved_doc_ids"]  # no hits cleared the threshold
 
     scores = [judge_calibration(judge_provider, ticket, outcome["response"]) for _ in range(n_runs)]

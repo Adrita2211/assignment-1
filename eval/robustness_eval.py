@@ -32,7 +32,7 @@ _BY_ID = {t["id"]: t for t in TICKETS}
 async def run_suite() -> dict:
     results = []
     for ticket in ROBUSTNESS_TICKETS:
-        outcome = await run_ticket(ticket["customer_id"], ticket["message"])
+        outcome = await run_ticket(ticket["customer_id"], ticket["message"], ticket_id=ticket["id"])
         required = ticket["required_tools"]
         actual = set(outcome["trajectory"])
         passed = required.issubset(actual)

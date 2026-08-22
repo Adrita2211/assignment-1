@@ -125,7 +125,7 @@ def judge_response(provider: GroqProvider, ticket: dict, response_text: str) -> 
 
 
 async def run_ticket(ticket: dict, judge_provider: GroqProvider, n_runs: int) -> dict:
-    async with SupportHarness(ticket["customer_id"]) as harness:
+    async with SupportHarness(ticket["customer_id"], ticket_id=ticket["id"]) as harness:
         response = await harness.handle_turn(ticket["message"])
         trace_id = harness.last_trace_id
 
