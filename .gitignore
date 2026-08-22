@@ -12,5 +12,7 @@ eval/run_history.jsonl
 eval/report_output.md
 data/cost_ledger.db
 data/hitl_store.db
+data/hitl_store_repro.db
+data/hitl_store_test.db
 
 .rds_master_password.tmp
