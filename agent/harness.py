@@ -246,7 +246,50 @@ def build_system_prompt(ticket_type: str, customer_id: str, policy_context: str,
 POLICY_DIR = Path(__file__).resolve().parent.parent / "policies"
 
 
-@lru_cache(maxsize=1)
+def _make_short_term_memory(customer_id: str, ticket_id: str):
+    """MEMORY_BACKEND=agentcore selects the real AgentCore Memory-backed
+    class (agent/memory_agentcore.py) -- the actual managed session state
+    the assignment names, now that it's wired up rather than just
+    auto-provisioned and unused. Defaults to the local, never-persisted
+    ShortTermMemory for local dev (unchanged prior behavior).
+
+    Deliberately NOT @lru_cache'd, unlike _compiled_graph()/_shared_retriever()
+    below -- this is per-(customer_id, ticket_id) conversation state, not a
+    process-wide singleton. A real bug, found and fixed in this same session:
+    an @lru_cache(maxsize=1) here (copied from _compiled_graph()'s pattern
+    without accounting for the difference) meant every SupportHarness
+    instance in a process received the exact same ShortTermMemory object
+    regardless of which customer or ticket it was for -- verified via a
+    real repro: two sequential SupportHarness sessions for the same ticket
+    showed identical Python object ids for .short_term, and a session for a
+    DIFFERENT customer would have silently inherited another customer's
+    conversation buffer. maxsize=1 is what made it acute (a single global
+    slot, not just occasional cache reuse) -- caught by comparing a direct,
+    isolated call to ShortTermMemoryAgentCore against the same call made
+    through SupportHarness and finding the two disagreed."""
+    if os.environ.get("MEMORY_BACKEND") == "agentcore":
+        from agent.memory_agentcore import ShortTermMemoryAgentCore
+
+        return ShortTermMemoryAgentCore(customer_id, ticket_id)
+    return ShortTermMemory()
+
+
+def _make_long_term_memory():
+    """Same MEMORY_BACKEND=agentcore switch as _make_short_term_memory()
+    above, for the AgentCore Memory long-term extraction strategies
+    (SEMANTIC/SUMMARY/USER_PREFERENCE) -- see agent/memory_agentcore.py's
+    LongTermMemoryAgentCore docstring for why this is a real capability
+    upgrade over LongTermMemory's static JSON lookup, not just a backend
+    swap. Process-wide singleton is fine here (unlike short-term memory):
+    this class holds no per-customer state itself, customer_id is passed
+    as an argument to get_history_summary() on each call."""
+    if os.environ.get("MEMORY_BACKEND") == "agentcore":
+        from agent.memory_agentcore import LongTermMemoryAgentCore
+
+        return LongTermMemoryAgentCore()
+    return LongTermMemory(DATA_DIR / "ticket_history.json")
+
+
 def _make_llm_provider():
     """LLM_PROVIDER=bedrock selects BedrockProvider (agent/provider.py),
     the real AgentCore-deployed path -- BEDROCK_MODEL_ID picks the model
@@ -803,8 +846,8 @@ class SupportHarness:
         self.ticket_id = ticket_id
         self.provider = provider or _make_llm_provider()
         self.retriever = _shared_retriever()
-        self.long_term = LongTermMemory(DATA_DIR / "ticket_history.json")
-        self.short_term = ShortTermMemory()
+        self.long_term = _make_long_term_memory()
+        self.short_term = _make_short_term_memory(customer_id, ticket_id)
         self.audit_log: list[dict] = []
         self.metrics_log: list[dict] = []  # one entry per LLM call this turn -- see metrics()
         self.cost_ledger = _make_cost_ledger()
@@ -927,6 +970,14 @@ class SupportHarness:
         # never being the one to leak it.
         final_text = redact_presidio(raw_final_text).redacted_text
         self.last_retrieved_doc_ids = final_state.get("retrieved_doc_ids", [])
+
+        # Real AgentCore Memory persistence (MEMORY_BACKEND=agentcore) --
+        # a no-op for the default local ShortTermMemory, which has no
+        # persist_turn method; the local buffer already persisted itself
+        # via the self.short_term.messages assignment above.
+        persist = getattr(self.short_term, "persist_turn", None)
+        if persist is not None:
+            persist(user_text, final_text)
 
         langfuse.update_current_span(
             output={"response": final_text, "trajectory": self.trajectory()},
