@@ -247,6 +247,28 @@ POLICY_DIR = Path(__file__).resolve().parent.parent / "policies"
 
 
 @lru_cache(maxsize=1)
+def _make_llm_provider():
+    """LLM_PROVIDER=bedrock selects BedrockProvider (agent/provider.py),
+    the real AgentCore-deployed path -- BEDROCK_MODEL_ID picks the model
+    (see agentcore_app.py / README for why this project's deployed
+    endpoint uses amazon.nova-lite-v1:0, not Claude: a real, found AWS
+    Marketplace payment-instrument block on Claude specifically, verified
+    via repeated retries, documented in the README rather than silently
+    worked around). Defaults to GroqProvider for local dev, unchanged from
+    every prior assignment -- this default existed nowhere before as an
+    explicit choice, it was simply the only path SupportHarness's
+    constructor ever took; this factory is what makes the deployed
+    (Bedrock) and local (Groq) paths an actual env-driven switch instead of
+    a hardcoded default that would have silently tried GroqProvider (and
+    failed on a missing GROQ_API_KEY) even inside the real AgentCore
+    deployment."""
+    if os.environ.get("LLM_PROVIDER") == "bedrock":
+        from agent.provider import BedrockProvider
+
+        return BedrockProvider()
+    return GroqProvider()
+
+
 def _make_cost_ledger():
     """COST_LEDGER_BACKEND=aurora selects the Aurora-backed ledger
     (agent/cost_ledger_aurora.py, RDS Data API against the same Aurora
@@ -779,7 +801,7 @@ class SupportHarness:
 
         self.customer_id = customer_id
         self.ticket_id = ticket_id
-        self.provider = provider or GroqProvider()
+        self.provider = provider or _make_llm_provider()
         self.retriever = _shared_retriever()
         self.long_term = LongTermMemory(DATA_DIR / "ticket_history.json")
         self.short_term = ShortTermMemory()
