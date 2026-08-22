@@ -19,7 +19,11 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from agent.harness import SupportHarness
+import uuid
+
+from agent.hitl import ApprovalAlreadyDecidedError, ApprovalExpiredError, StaleStateError
+from agent.hitl_store import HITLStore
+from agent.harness import SupportHarness, resume_after_approval
 from agent.tracing import langfuse
 
 load_dotenv()
@@ -38,6 +42,11 @@ class ChatResponse(BaseModel):
     trace_id: str | None = None
 
 
+class ApprovalDecideRequest(BaseModel):
+    status: str  # "approved" | "rejected"
+    decided_by: str
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -49,7 +58,7 @@ async def chat(body: ChatRequest):
         raise HTTPException(status_code=400, detail="missing 'message'")
 
     try:
-        async with SupportHarness(body.customer_id) as harness:
+        async with SupportHarness(body.customer_id, ticket_id=uuid.uuid4().hex) as harness:
             response_text = await harness.handle_turn(body.message)
             trajectory = harness.trajectory()
             trace_id = harness.last_trace_id
@@ -61,6 +70,27 @@ async def chat(body: ChatRequest):
     # timer, same reasoning as agent-cicd-demo's app/server.py.
     langfuse.flush()
     return ChatResponse(response=response_text, trajectory=trajectory, trace_id=trace_id)
+
+
+@app.get("/approvals")
+def list_approvals():
+    """Enough for a human-reviewer flow to be testable end to end -- no
+    polished UI, just the pending queue a real reviewer would work from."""
+    store = HITLStore()
+    return {"pending": [a.model_dump() for a in store.list_pending()]}
+
+
+@app.post("/approvals/{approval_id}/decide")
+async def decide_approval(approval_id: str, body: ApprovalDecideRequest):
+    try:
+        result = await resume_after_approval(approval_id, body.status, body.decided_by)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except (ApprovalAlreadyDecidedError, ApprovalExpiredError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except StaleStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return result
 
 
 if __name__ == "__main__":
