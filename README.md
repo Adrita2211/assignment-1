@@ -1481,15 +1481,15 @@ and live.
 **The AWS provisioning batch ran for real.** In order, all actually done
 and live-verified this session:
 
-1. ✅ Aurora Serverless v2 + pgvector provisioned (`infra/create_kb_aurora.sh`).
-2. ✅ Bedrock Knowledge Base created, all 7 `policies/*.md` docs ingested
+1.  Aurora Serverless v2 + pgvector provisioned (`infra/create_kb_aurora.sh`).
+2.  Bedrock Knowledge Base created, all 7 `policies/*.md` docs ingested
    successfully (section 16).
-3. ✅ Bedrock Guardrail provisioned and live-verified in both directions
+3. Bedrock Guardrail provisioned and live-verified in both directions
    against Presidio (section 17).
-4. ✅ Amazon Verified Permissions policy store, schema, and four Cedar
+4. Amazon Verified Permissions policy store, schema, and four Cedar
    policies provisioned and live-verified across all four branches
    (section 19).
-5. ✅ `agentcore configure` / `agentcore deploy`, real live invocations
+5.  `agentcore configure` / `agentcore deploy`, real live invocations
    confirmed against the deployed AgentCore Runtime endpoint, using
    `amazon.nova-lite-v1:0` -- **not Claude**, a real, confirmed blocker:
    this AWS account's Bedrock access to Claude models specifically fails
