@@ -1457,6 +1457,27 @@ HITL gate's number is grounded in policy, not invented only in code.
 
 ## 24. AWS provisioning status and ECS/ALB teardown
 
+**The AgentCore Runtime + Memory deployment now runs entirely through
+CloudFormation, not the `agentcore` CLI.** The CLI-created Runtime,
+Memory, and execution role were deliberately deleted and recreated purely
+from `infra/cloudformation/agentcore-infra.yaml` -- closing the
+reproducibility gap the CLI-only path left (a machine-local,
+non-version-controlled `.bedrock_agentcore.yaml`). Real, live-found gap in
+the process: the hand-written CFN execution role initially omitted
+AgentCore Memory permissions the CLI's auto-generated role had -- caught
+by an actual `AccessDeniedException` on `bedrock-agentcore:ListEvents`
+from a real invocation, not assumed, then fixed in both the live role and
+the template (see the git history for the exact commit). Re-verified live
+afterward: order lookup, PII masking, and a real Amazon Verified
+Permissions rejection (suspended account) all confirmed working through
+the CloudFormation-managed endpoint
+(`arn:aws:bedrock-agentcore:us-east-1:058264386876:runtime/ecommerce_agent-4ks2toDNhf`).
+Current stack parameters: `HITL_BACKEND=sqlite`, `COST_LEDGER_BACKEND=sqlite`,
+`BEDROCK_KNOWLEDGE_BASE_ID=""` (Aurora/KB intentionally still commented out
+in the template per the demo-sequencing note at its top) --
+`POLICY_BOUNDARY_BACKEND=avp` and `MEMORY_BACKEND=agentcore` are both real
+and live.
+
 **The AWS provisioning batch ran for real.** In order, all actually done
 and live-verified this session:
 
