@@ -139,6 +139,28 @@ Resources:
                   - xray:PutTraceSegments
                   - xray:PutTelemetryRecords
                 Resource: "*"
+              # Real, found-live gap: agent/memory_agentcore.py's
+              # ShortTermMemoryAgentCore/LongTermMemoryAgentCore need these
+              # to actually call create_event/get_last_k_turns/retrieve_memories
+              # -- omitted here originally, caught by a real AccessDeniedException
+              # ("... is not authorized to perform: bedrock-agentcore:ListEvents ...")
+              # from an actual invocation against this CloudFormation-deployed
+              # stack, not assumed from reading the SDK.
+              - Sid: BedrockAgentCoreMemory
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:CreateEvent
+                  - bedrock-agentcore:GetEvent
+                  - bedrock-agentcore:ListEvents
+                  - bedrock-agentcore:DeleteEvent
+                  - bedrock-agentcore:GetMemory
+                  - bedrock-agentcore:GetMemoryRecord
+                  - bedrock-agentcore:ListMemoryRecords
+                  - bedrock-agentcore:DeleteMemoryRecord
+                  - bedrock-agentcore:RetrieveMemoryRecords
+                  - bedrock-agentcore:ListActors
+                  - bedrock-agentcore:ListSessions
+                Resource: !GetAtt AgentMemory.MemoryArn
 
   # Fn::If + AWS::NoValue only reliably omits a PROPERTY, not a list ELEMENT
   # -- using it to conditionally drop a Statement array item is a known
