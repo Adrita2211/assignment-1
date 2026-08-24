@@ -1,0 +1,51 @@
+# Real, working Dockerfile for the Bedrock AgentCore Runtime deployment
+# (agentcore_app.py) -- checked in deliberately, unlike the version
+# `agentcore configure` auto-generates into the gitignored .bedrock_agentcore/
+# directory. Relying on that regenerated-per-machine file for CI would mean
+# either running the agentcore CLI inside CI just to produce a Dockerfile
+# (fragile, needs AWS creds during configure) or hoping nobody edits it
+# out from under version control. This file is that generated Dockerfile's
+# content, with the two real fixes already found and verified live this
+# session baked in permanently:
+#   1. CPU-only torch first -- PyPI's default wheel bundles ~2GB of unused
+#      CUDA/GPU libraries, which pushed the image past AgentCore Runtime's
+#      maxImageSizeMb quota (a real ServiceQuotaExceededException hit and
+#      fixed this session, see README section 15).
+#   2. en_core_web_lg downloaded explicitly -- agent/pii.py's Presidio
+#      layer needs it at runtime; it's not pip-installable via
+#      requirements.txt.
+FROM ghcr.io/astral-sh/uv:python3.11-bookworm-slim
+WORKDIR /app
+
+ENV UV_SYSTEM_PYTHON=1 \
+    UV_COMPILE_BYTECODE=1 \
+    UV_NO_PROGRESS=1 \
+    PYTHONUNBUFFERED=1 \
+    DOCKER_CONTAINER=1 \
+    AWS_REGION=us-east-1 \
+    AWS_DEFAULT_REGION=us-east-1
+
+COPY requirements.txt requirements.txt
+RUN uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+RUN uv pip install -r requirements.txt
+RUN uv pip install --no-deps https://github.com/explosion/spacy-models/releases/download/en_core_web_lg-3.8.0/en_core_web_lg-3.8.0-py3-none-any.whl
+RUN uv pip install aws-opentelemetry-distro==0.12.2
+
+RUN useradd -m -u 1000 bedrock_agentcore
+
+# --chown here (a real fix over the CLI-generated version, which copies as
+# root even though USER is already switched -- Docker's COPY doesn't
+# inherit the active USER's ownership without --chown) -- this is what
+# actually caused the "attempt to write a readonly database" bug
+# (agent/cost_ledger.py, found live and made non-fatal as a defense, but
+# the root cause is fixed here too: the non-root runtime user now
+# genuinely owns its own working directory).
+COPY --chown=bedrock_agentcore:bedrock_agentcore . .
+
+USER bedrock_agentcore
+
+EXPOSE 9000
+EXPOSE 8000
+EXPOSE 8080
+
+CMD ["opentelemetry-instrument", "python", "-m", "agentcore_app"]
