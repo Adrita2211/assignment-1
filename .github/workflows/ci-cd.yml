@@ -33,7 +33,15 @@ jobs:
   # (trajectory); this job is slow, judge-heavy, and exists for evidence and
   # review, not to sit on the deploy critical path.
   full-eval-report:
-    if: github.event_name == 'workflow_dispatch'
+    # Deliberately sequenced after eval-gate, not run in parallel with it --
+    # a real found bug: both jobs call the same GROQ_API_KEY, and running
+    # them concurrently on a manual workflow_dispatch blew past Groq's
+    # free-tier 8000 TPM rate limit (a real groq.RateLimitError caught from
+    # an actual triggered run, not assumed), failing eval-gate for a reason
+    # that had nothing to do with the agent's actual behavior. `needs:`
+    # forces this job to wait for eval-gate's token usage to finish first.
+    if: always() && github.event_name == 'workflow_dispatch'
+    needs: eval-gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
