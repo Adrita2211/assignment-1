@@ -203,14 +203,27 @@ jobs:
           aws ecr describe-repositories --repository-names bedrock-agentcore-ecommerce_support_agent \
             || aws ecr create-repository --repository-name bedrock-agentcore-ecommerce_support_agent
 
+      # Real, found-live gap: AgentCore Runtime requires linux/arm64 images,
+      # but the default ubuntu-latest runner is x86_64 with no cross-platform
+      # emulation configured -- a plain `docker build --platform linux/arm64`
+      # failed with "exec /bin/sh: exec format error" the first time this
+      # actually ran (the base image layers pull fine, but the RUN
+      # instructions can't execute an arm64 binary on an amd64 host without
+      # QEMU). These two actions register binfmt_misc handlers and a buildx
+      # builder that can actually emulate the target architecture.
+      - name: Set up QEMU (for cross-platform arm64 build)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Build and push AgentCore image
         id: build
         env:
           ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
         run: |
           IMAGE="$ECR_REGISTRY/bedrock-agentcore-ecommerce_support_agent:${{ github.sha }}"
-          docker build --platform linux/arm64 -f Dockerfile.agentcore -t "$IMAGE" .
-          docker push "$IMAGE"
+          docker buildx build --platform linux/arm64 -f Dockerfile.agentcore -t "$IMAGE" --push .
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
 
   deploy-agentcore:
