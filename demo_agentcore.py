@@ -16,6 +16,8 @@ import boto3
 
 AGENT_RUNTIME_ARN = "arn:aws:bedrock-agentcore:us-east-1:058264386876:runtime/ecommerce_agent-4ks2toDNhf"
 REGION = "us-east-1"
+GUARDRAIL_ID = "8c3d1djf3a5a"
+GUARDRAIL_VERSION = "1"
 
 _client = boto3.client("bedrock-agentcore", region_name=REGION)
 
@@ -50,6 +52,32 @@ def pii_masking():
     _banner("2. PII masking -- Presidio + Bedrock Guardrails, layered")
     result = invoke({"customer_id": "CUST002", "message": "What phone number and address do you have on file for me?"})
     print(result.get("response", result))
+
+
+def guardrail_layering():
+    """Calls agent/pii.py's redact_bedrock_guardrails() directly -- the
+    same function agent/pii.py's redact_text()/redact_value() route
+    through at the real enforcement points (final reply, tool results,
+    trace payloads) whenever BEDROCK_GUARDRAIL_ID is set, as it is on the
+    live deployed Runtime. Deliberately NOT routed through invoke() like
+    the other scenarios: the LLM can (and did, in earlier testing) simply
+    decline to repeat PII back in its reply, which proves nothing about
+    whether the redaction layer itself works. This proves the layer
+    directly, on an entity type (SSN/credit card) this project's Presidio
+    recognizers don't cover, so a masked result here can only be
+    Guardrails' own catch, not Presidio's."""
+    _banner("2b. Guardrails layering, directly -- entities Presidio alone misses")
+    import os
+
+    os.environ.setdefault("AWS_REGION", REGION)
+    from agent.pii import redact_bedrock_guardrails
+
+    text = "My SSN is 078-05-1120 and my card number is 4111 1111 1111 1111"
+    result = redact_bedrock_guardrails(text, GUARDRAIL_ID, GUARDRAIL_VERSION)
+    print("input:   ", text)
+    print("redacted:", result.redacted_text)
+    for finding in result.findings:
+        print(f"  caught by {finding.detector}: {finding.entity_type} [{finding.start}:{finding.end}]")
 
 
 def policy_rejection():
@@ -93,6 +121,7 @@ def damaged_order_auto_refund(customer_id: str, order_id: str):
 SCENARIOS = {
     "lookup": order_lookup,
     "pii": pii_masking,
+    "guardrails": guardrail_layering,
     "rejection": policy_rejection,
     "refund": lambda: damaged_order_auto_refund("CUST001", "ORD1001"),
 }
@@ -104,5 +133,6 @@ if __name__ == "__main__":
     else:
         order_lookup()
         pii_masking()
+        guardrail_layering()
         policy_rejection()
         _banner("Demo complete -- for HITL, call hitl_gate(...)/hitl_resume(...) interactively")
