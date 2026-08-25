@@ -26,6 +26,8 @@ which specific real leak enforcement point #2 exists to close):
 """
 from __future__ import annotations
 
+import os
+
 from pydantic import BaseModel, ConfigDict
 
 _analyzer = None
@@ -200,12 +202,34 @@ def redact_bedrock_guardrails(text: str, guardrail_id: str, guardrail_version: s
     return RedactionResult(redacted_text=redacted_text, findings=findings)
 
 
+def _guardrail_env_config() -> tuple[bool, str | None, str | None]:
+    """Reads Guardrail config from the environment (set by
+    infra/cloudformation/agentcore-infra.yaml's EnvironmentVariables block
+    in the deployed Runtime). Layering only activates when a guardrail ID
+    is actually configured -- local/CI runs with no env vars set silently
+    stay Presidio-only, same as before this wiring existed."""
+    guardrail_id = os.environ.get("BEDROCK_GUARDRAIL_ID")
+    guardrail_version = os.environ.get("BEDROCK_GUARDRAIL_VERSION", "1")
+    return bool(guardrail_id), guardrail_id, guardrail_version
+
+
+def redact_text(text: str) -> str:
+    """The real enforcement entry point for flat text (the final reply,
+    see agent/harness.py's handle_turn) -- layers Bedrock Guardrails on
+    top of Presidio whenever BEDROCK_GUARDRAIL_ID is configured in the
+    environment, per redact_layered's union semantics."""
+    use_guardrails, guardrail_id, guardrail_version = _guardrail_env_config()
+    return redact_layered(text, use_guardrails, guardrail_id, guardrail_version).redacted_text
+
+
 def redact_value(value):
     """Recursively redact every string leaf in a dict/list/scalar
     structure -- used for tool results and error payloads, which are
-    nested (e.g. an account's shipping_address), not flat text."""
+    nested (e.g. an account's shipping_address), not flat text. Routes
+    through redact_text so Guardrails layering (when configured) applies
+    here too, not just to the final reply."""
     if isinstance(value, str):
-        return redact_presidio(value).redacted_text
+        return redact_text(value)
     if isinstance(value, dict):
         return {k: redact_value(v) for k, v in value.items()}
     if isinstance(value, list):

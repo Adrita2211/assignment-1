@@ -68,7 +68,7 @@ from agent.hitl import ApprovalStatus, DuplicatePendingActionError, new_pending_
 from agent.hitl_store import HITLStore
 from agent.memory import LongTermMemory, ShortTermMemory
 from agent.mcp_client import MCPToolClient
-from agent.pii import redact_presidio
+from agent.pii import redact_text
 from agent.policy_boundary import evaluate_refund_policy
 
 
@@ -968,7 +968,7 @@ class SupportHarness:
         # can't recite a customer's own email back verbatim even when that
         # would be legitimately useful for a confirmation), traded for
         # never being the one to leak it.
-        final_text = redact_presidio(raw_final_text).redacted_text
+        final_text = redact_text(raw_final_text)
         self.last_retrieved_doc_ids = final_state.get("retrieved_doc_ids", [])
 
         # Real AgentCore Memory persistence (MEMORY_BACKEND=agentcore) --

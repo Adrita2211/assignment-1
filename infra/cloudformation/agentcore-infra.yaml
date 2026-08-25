@@ -63,6 +63,17 @@ Parameters:
     Type: String
     Default: ""
     Description: Existing RDS subnet group. Only required if the Aurora block below is uncommented.
+  BedrockGuardrailId:
+    Type: String
+    Default: ""
+    Description: >
+      Bedrock Guardrails ID for layered PII redaction (agent/pii.py's
+      redact_layered, unioned with Presidio -- see redact_text). Blank
+      means the deployed agent stays Presidio-only, same as before this
+      was wired in.
+  BedrockGuardrailVersion:
+    Type: String
+    Default: "1"
 
 Conditions:
   HasAuroraCluster: !Not [!Equals [!Ref AuroraClusterArn, ""]]
@@ -259,6 +270,8 @@ Resources:
         AURORA_SECRET_ARN: !Ref AuroraSecretArn
         AURORA_DATABASE: kbdb
         BEDROCK_KNOWLEDGE_BASE_ID: !Ref BedrockKnowledgeBaseId
+        BEDROCK_GUARDRAIL_ID: !Ref BedrockGuardrailId
+        BEDROCK_GUARDRAIL_VERSION: !Ref BedrockGuardrailVersion
 
   # =======================================================================
   # Aurora Serverless v2 + pgvector + Bedrock Knowledge Base. Mirrors

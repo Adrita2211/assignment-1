@@ -249,7 +249,9 @@ jobs:
               AvpPolicyStoreId=${{ vars.AVP_POLICY_STORE_ID }} \
               AuroraClusterArn=${{ vars.AURORA_CLUSTER_ARN }} \
               AuroraSecretArn=${{ vars.AURORA_SECRET_ARN }} \
-              BedrockKnowledgeBaseId=${{ vars.BEDROCK_KNOWLEDGE_BASE_ID }}
+              BedrockKnowledgeBaseId=${{ vars.BEDROCK_KNOWLEDGE_BASE_ID }} \
+              BedrockGuardrailId=${{ vars.BEDROCK_GUARDRAIL_ID }} \
+              BedrockGuardrailVersion=${{ vars.BEDROCK_GUARDRAIL_VERSION }}
 
       - name: Smoke-test the deployed endpoint
         run: |
