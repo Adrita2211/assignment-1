@@ -1,7 +1,6 @@
 # ecommerce-support-agent Assignment 3 infra: Bedrock AgentCore Runtime +
-# Memory, and (commented out below, see "DEMO" markers) the Aurora
-# Serverless v2 + pgvector cluster and Bedrock Knowledge Base that back
-# retrieval and the HITL/cost-ledger persistence.
+# Memory, and the Aurora Serverless v2 + pgvector cluster and Bedrock
+# Knowledge Base that back retrieval and the HITL/cost-ledger persistence.
 #
 # Deliberate boundary, same split as infra/cloudformation/agent-infra.yaml's
 # ECS stack: this template owns the AgentCore Runtime/Memory *resources*.
@@ -13,23 +12,23 @@
 #
 # Real schema verified against `aws cloudformation describe-type` for
 # AWS::BedrockAgentCore::Runtime and AWS::BedrockAgentCore::Memory before
-# writing this -- not assumed from documentation alone.
+# writing this -- not assumed from documentation alone. The Aurora/KB
+# block below was likewise validated for real via an isolated
+# `aws cloudformation create-change-set` (non-colliding AppName, not
+# executed) before being enabled here.
 #
-# DEMO SEQUENCING: the Aurora/Knowledge Base resources are commented out by
-# default so this stack can be deployed/torn down cheaply without incurring
-# Aurora's continuous ACU-hour billing (see README's "provision, verify,
-# tear down" cost discipline). Uncomment the block marked
-# "UNCOMMENT FOR DEMO" below, fill in DbMasterPassword, and redeploy to
-# bring Aurora + the Knowledge Base up. The Runtime resource references
+# IMPORTANT, read the Aurora/KB block's own header comment before
+# deploying it: the Aurora cluster and Knowledge Base currently live in
+# this account were created by infra/create_kb_aurora.sh's imperative CLI
+# calls, not by this stack, so a plain deploy of this template as-is will
+# collide on the DBCluster identifier. The Runtime resource references
 # AuroraClusterArn/AuroraSecretArn/BedrockKnowledgeBaseId as *parameters*
-# (not !Ref/!GetAtt against the commented-out resources), so uncommenting
-# those resources doesn't require touching the Runtime resource at all --
-# just pass the newly-created ARNs as parameter values on the next deploy.
+# (not !Ref/!GetAtt against the Aurora/KB resources below), so the two
+# halves of this template can be deployed independently of each other.
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  Bedrock AgentCore Runtime + Memory for ecommerce-support-agent (Assignment 3).
-  Aurora + Bedrock Knowledge Base are commented out by default -- see the
-  DEMO SEQUENCING note above.
+  Bedrock AgentCore Runtime + Memory, plus Aurora Serverless v2 + pgvector
+  and a Bedrock Knowledge Base, for ecommerce-support-agent (Assignment 3).
 
 Parameters:
   AppName:
@@ -271,16 +270,34 @@ Resources:
         BEDROCK_KNOWLEDGE_BASE_ID: !Ref BedrockKnowledgeBaseId
 
   # =======================================================================
-  # UNCOMMENT FOR DEMO -- Aurora Serverless v2 + pgvector + Bedrock
-  # Knowledge Base. Mirrors infra/create_kb_aurora.sh exactly, as real
-  # CloudFormation resources instead of imperative CLI calls.
+  # Aurora Serverless v2 + pgvector + Bedrock Knowledge Base. Mirrors
+  # infra/create_kb_aurora.sh as real CloudFormation resources. Validated
+  # via a real `aws cloudformation create-change-set` (isolated, with a
+  # non-colliding AppName, not executed) before uncommenting here --
+  # CREATE_COMPLETE, no schema issues found.
   #
-  # After uncommenting: fill in DbMasterPassword and DbSubnetGroupName
-  # params, deploy, then take the outputs (AuroraClusterArnOut,
+  # *** REAL, LIVE CAVEAT, READ BEFORE DEPLOYING THIS BLOCK ***
+  # The Aurora cluster/instance and Knowledge Base currently live in this
+  # account (ecommerce-agent-kb-aurora, KB id GZVAPQMW1F) were created by
+  # infra/create_kb_aurora.sh's imperative CLI calls, NOT by this
+  # CloudFormation stack -- they are unmanaged by CloudFormation, referenced
+  # by this stack only as parameter values (AuroraClusterArn/
+  # AuroraSecretArn/BedrockKnowledgeBaseId on the Outputs/Runtime side).
+  # If you deploy THIS block as-is against the SAME account, CloudFormation
+  # will try to CREATE a new DBCluster with the identifier
+  # "ecommerce-agent-kb-aurora" -- which already exists -- and fail with
+  # DBClusterAlreadyExistsFault. Before deploying this block for real,
+  # either (a) change AppName so the identifiers don't collide with the
+  # script-created resources, (b) tear down the script-created Aurora/KB
+  # first (infra/teardown_kb_aurora.sh), or (c) import the existing
+  # resources into this stack's management via `aws cloudformation
+  # create-change-set --change-set-type IMPORT` instead of a normal deploy.
+  #
+  # After a successful deploy: take the outputs (AuroraClusterArnOut,
   # AuroraSecretArnOut, KnowledgeBaseIdOut) and redeploy this SAME stack
   # passing them back in as AuroraClusterArn/AuroraSecretArn/
-  # BedrockKnowledgeBaseId -- the Runtime resource picks them up via the
-  # Conditions above with no other changes needed.
+  # BedrockKnowledgeBaseId -- the Runtime resource already picks them up
+  # via the Conditions above with no other changes needed.
   #
   # Note: the pgvector schema itself (CREATE EXTENSION vector; the
   # bedrock_integration.bedrock_kb table; its HNSW + full-text indexes)
@@ -291,112 +308,112 @@ Resources:
   # fully declarative too.
   # =======================================================================
 
-  # AuroraCluster:
-  #   Type: AWS::RDS::DBCluster
-  #   Properties:
-  #     DBClusterIdentifier: !Sub "${AppName}-kb-aurora"
-  #     Engine: aurora-postgresql
-  #     EngineVersion: "16.14"
-  #     EngineMode: provisioned
-  #     ServerlessV2ScalingConfiguration:
-  #       MinCapacity: 0.5
-  #       MaxCapacity: 1
-  #     MasterUsername: kbadmin
-  #     MasterUserPassword: !Ref DbMasterPassword
-  #     DBSubnetGroupName: !Ref DbSubnetGroupName
-  #     EnableHttpEndpoint: true
-  #     DatabaseName: kbdb
-  #
-  # AuroraInstance:
-  #   Type: AWS::RDS::DBInstance
-  #   Properties:
-  #     DBInstanceIdentifier: !Sub "${AppName}-kb-aurora-instance-1"
-  #     DBClusterIdentifier: !Ref AuroraCluster
-  #     Engine: aurora-postgresql
-  #     DBInstanceClass: db.serverless
-  #
-  # KbPoliciesBucket:
-  #   Type: AWS::S3::Bucket
-  #   Properties:
-  #     BucketName: !Sub "${AppName}-kb-policies-${AWS::AccountId}"
-  #
-  # KbServiceRole:
-  #   Type: AWS::IAM::Role
-  #   Properties:
-  #     RoleName: !Sub "${AppName}-kb-service-role"
-  #     AssumeRolePolicyDocument:
-  #       Version: "2012-10-17"
-  #       Statement:
-  #         - Effect: Allow
-  #           Principal:
-  #             Service: bedrock.amazonaws.com
-  #           Action: sts:AssumeRole
-  #           Condition:
-  #             StringEquals:
-  #               aws:SourceAccount: !Ref AWS::AccountId
-  #             ArnLike:
-  #               aws:SourceArn: !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*"
-  #     Policies:
-  #       - PolicyName: kb-access-policy
-  #         PolicyDocument:
-  #           Version: "2012-10-17"
-  #           Statement:
-  #             - Effect: Allow
-  #               Action: ["s3:GetObject", "s3:ListBucket"]
-  #               Resource:
-  #                 - !GetAtt KbPoliciesBucket.Arn
-  #                 - !Sub "${KbPoliciesBucket.Arn}/*"
-  #             - Effect: Allow
-  #               Action: bedrock:InvokeModel
-  #               Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0"
-  #             - Effect: Allow
-  #               Action: ["rds-data:ExecuteStatement", "rds-data:BatchExecuteStatement", "rds:DescribeDBClusters"]
-  #               Resource: !GetAtt AuroraCluster.DBClusterArn
-  #             - Effect: Allow
-  #               Action: secretsmanager:GetSecretValue
-  #               Resource: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
-  #
-  # KnowledgeBase:
-  #   Type: AWS::Bedrock::KnowledgeBase
-  #   Properties:
-  #     Name: !Sub "${AppName}-refund-policies"
-  #     RoleArn: !GetAtt KbServiceRole.Arn
-  #     KnowledgeBaseConfiguration:
-  #       Type: VECTOR
-  #       VectorKnowledgeBaseConfiguration:
-  #         EmbeddingModelArn: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0"
-  #     StorageConfiguration:
-  #       Type: RDS
-  #       RdsConfiguration:
-  #         ResourceArn: !GetAtt AuroraCluster.DBClusterArn
-  #         CredentialsSecretArn: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
-  #         DatabaseName: kbdb
-  #         TableName: bedrock_integration.bedrock_kb
-  #         FieldMapping:
-  #           PrimaryKeyField: id
-  #           VectorField: embedding
-  #           TextField: chunks
-  #           MetadataField: metadata
-  #
-  # KbDataSource:
-  #   Type: AWS::Bedrock::DataSource
-  #   Properties:
-  #     KnowledgeBaseId: !Ref KnowledgeBase
-  #     Name: policies-s3-source
-  #     DataSourceConfiguration:
-  #       Type: S3
-  #       S3Configuration:
-  #         BucketArn: !GetAtt KbPoliciesBucket.Arn
-  #         InclusionPrefixes: ["policies/"]
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      DBClusterIdentifier: !Sub "${AppName}-kb-aurora"
+      Engine: aurora-postgresql
+      EngineVersion: "16.14"
+      EngineMode: provisioned
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0.5
+        MaxCapacity: 1
+      MasterUsername: kbadmin
+      MasterUserPassword: !Ref DbMasterPassword
+      DBSubnetGroupName: !Ref DbSubnetGroupName
+      EnableHttpEndpoint: true
+      DatabaseName: kbdb
+
+  AuroraInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub "${AppName}-kb-aurora-instance-1"
+      DBClusterIdentifier: !Ref AuroraCluster
+      Engine: aurora-postgresql
+      DBInstanceClass: db.serverless
+
+  KbPoliciesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AppName}-kb-policies-${AWS::AccountId}"
+
+  KbServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}-kb-service-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*"
+      Policies:
+        - PolicyName: kb-access-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["s3:GetObject", "s3:ListBucket"]
+                Resource:
+                  - !GetAtt KbPoliciesBucket.Arn
+                  - !Sub "${KbPoliciesBucket.Arn}/*"
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0"
+              - Effect: Allow
+                Action: ["rds-data:ExecuteStatement", "rds-data:BatchExecuteStatement", "rds:DescribeDBClusters"]
+                Resource: !GetAtt AuroraCluster.DBClusterArn
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+
+  KnowledgeBase:
+    Type: AWS::Bedrock::KnowledgeBase
+    Properties:
+      Name: !Sub "${AppName}-refund-policies"
+      RoleArn: !GetAtt KbServiceRole.Arn
+      KnowledgeBaseConfiguration:
+        Type: VECTOR
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0"
+      StorageConfiguration:
+        Type: RDS
+        RdsConfiguration:
+          ResourceArn: !GetAtt AuroraCluster.DBClusterArn
+          CredentialsSecretArn: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+          DatabaseName: kbdb
+          TableName: bedrock_integration.bedrock_kb
+          FieldMapping:
+            PrimaryKeyField: id
+            VectorField: embedding
+            TextField: chunks
+            MetadataField: metadata
+
+  KbDataSource:
+    Type: AWS::Bedrock::DataSource
+    Properties:
+      KnowledgeBaseId: !Ref KnowledgeBase
+      Name: policies-s3-source
+      DataSourceConfiguration:
+        Type: S3
+        S3Configuration:
+          BucketArn: !GetAtt KbPoliciesBucket.Arn
+          InclusionPrefixes: ["policies/"]
 
 Outputs:
   AgentRuntimeArn:
     Value: !GetAtt AgentRuntime.AgentRuntimeArn
   AgentMemoryId:
     Value: !GetAtt AgentMemory.MemoryId
-  # AuroraClusterArnOut:
-  #   Value: !GetAtt AuroraCluster.DBClusterArn
-  # AuroraSecretArnOut:
-  #   Value: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
-  # KnowledgeBaseIdOut:
-  #   Value: !Ref KnowledgeBase
+  AuroraClusterArnOut:
+    Value: !GetAtt AuroraCluster.DBClusterArn
+  AuroraSecretArnOut:
+    Value: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+  KnowledgeBaseIdOut:
+    Value: !Ref KnowledgeBase
