@@ -11,6 +11,8 @@ to), no GROQ_API_KEY needed -- this hits real Bedrock Nova Lite.
 """
 import json
 import sys
+import time
+import uuid
 
 import boto3
 
@@ -80,6 +82,42 @@ def guardrail_layering():
         print(f"  caught by {finding.detector}: {finding.entity_type} [{finding.start}:{finding.end}]")
 
 
+def short_term_memory(customer_id: str = "CUST002"):
+    """Two turns in the SAME session (same ticket_id) -- proves
+    ShortTermMemoryAgentCore (agent/memory_agentcore.py) round-trips
+    through real AgentCore Memory create_event/get_last_k_turns, not just
+    an in-process list: the second call is a fresh invoke_agent_runtime
+    request, so the only way turn 2 can reference turn 1 is if the prior
+    turn was actually persisted and reloaded from AgentCore, not kept in
+    a variable somewhere."""
+    _banner("6a. Short-term memory -- same session, across two separate invokes")
+    ticket_id = f"demo-memory-{uuid.uuid4().hex[:8]}"
+    print(f"(ticket_id: {ticket_id})")
+    r1 = invoke({"customer_id": customer_id, "ticket_id": ticket_id, "message": "What's the status of order ORD1002?"})
+    print("\nTurn 1:", r1.get("response", r1))
+    r2 = invoke({"customer_id": customer_id, "ticket_id": ticket_id, "message": "What order number did I just ask you about?"})
+    print("\nTurn 2 (should reference ORD1002 without being told again):", r2.get("response", r2))
+
+
+def long_term_memory(customer_id: str = "CUST002"):
+    """Two SEPARATE sessions (different ticket_ids), same customer --
+    proves LongTermMemoryAgentCore's retrieve_memories() surfaces real,
+    AI-extracted facts/preferences across sessions, not just short-term
+    per-ticket recall. AgentCore's extraction strategies run
+    asynchronously after create_event, so this sleeps before the second
+    session to give extraction time to land -- a real, honest cost of
+    this feature, not an artifact of the demo."""
+    _banner("6b. Long-term memory -- across separate sessions, real AI-extracted facts")
+    session1 = f"demo-memory-s1-{uuid.uuid4().hex[:8]}"
+    r1 = invoke({"customer_id": customer_id, "ticket_id": session1, "message": "Please note I prefer to be contacted by email, not phone, for any follow-ups."})
+    print(f"\nSession 1 ({session1}):", r1.get("response", r1))
+    print("\n(waiting ~20s for AgentCore's async long-term extraction to complete...)")
+    time.sleep(20)
+    session2 = f"demo-memory-s2-{uuid.uuid4().hex[:8]}"
+    r2 = invoke({"customer_id": customer_id, "ticket_id": session2, "message": "Do you have any notes on how I prefer to be contacted?"})
+    print(f"\nSession 2, brand-new ticket ({session2}):", r2.get("response", r2))
+
+
 def policy_rejection():
     _banner("3. Policy boundary rejection -- real Amazon Verified Permissions")
     result = invoke({
@@ -122,6 +160,8 @@ SCENARIOS = {
     "lookup": order_lookup,
     "pii": pii_masking,
     "guardrails": guardrail_layering,
+    "memory-short": short_term_memory,
+    "memory-long": long_term_memory,
     "rejection": policy_rejection,
     "refund": lambda: damaged_order_auto_refund("CUST001", "ORD1001"),
 }

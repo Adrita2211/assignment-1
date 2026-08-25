@@ -129,12 +129,27 @@ class LongTermMemoryAgentCore:
         if self.memory_id is None:
             return "No prior support tickets on file for this customer."
 
+        # FOUND AND FIXED (real, live-discovered bug): these namespaces
+        # must match the Memory resource's actual configured strategy
+        # namespaces exactly, or retrieve_memories() silently returns
+        # nothing forever -- no error, just an empty result, indistinguishable
+        # from "extraction hasn't landed yet". They previously read
+        # "ecommerce_facts/{customer_id}" / "ecommerce_prefs/{customer_id}",
+        # left over from the original CLI-created Memory resource. The
+        # CloudFormation-managed Memory (infra/cloudformation/agentcore-infra.yaml,
+        # AgentMemory resource) uses literal "facts/{actorId}" /
+        # "prefs/{actorId}" namespace templates (hardcoded strings, not
+        # !Sub, per the CFN early-validation quirk documented on that
+        # resource) -- confirmed via a real `get_memory` call against the
+        # live resource, not assumed. actorId is customer_id throughout
+        # this project (see ShortTermMemoryAgentCore), so the literal
+        # namespace is "facts/<customer_id>" / "prefs/<customer_id>".
         facts = self.client.retrieve_memories(
-            memory_id=self.memory_id, namespace=f"ecommerce_facts/{customer_id}",
+            memory_id=self.memory_id, namespace=f"facts/{customer_id}",
             actor_id=customer_id, query="past support tickets and preferences for this customer", top_k=5,
         )
         prefs = self.client.retrieve_memories(
-            memory_id=self.memory_id, namespace=f"ecommerce_prefs/{customer_id}",
+            memory_id=self.memory_id, namespace=f"prefs/{customer_id}",
             actor_id=customer_id, query="customer preferences", top_k=3,
         )
         lines = []
