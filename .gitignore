@@ -2,3 +2,23 @@
 __pycache__/
 *.pyc
 .env
+.env.local
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+task-definition.json
+eval/run_history.jsonl
+eval/report_output.md
+data/cost_ledger.db
+data/hitl_store.db
+data/hitl_store_repro.db
+data/hitl_store_test.db
+
+.rds_master_password.tmp
+
+# agentcore configure/deploy generated config -- embeds absolute local
+# paths, regenerate with `agentcore configure` rather than committing.
+.bedrock_agentcore/
+.bedrock_agentcore.yaml
+.dockerignore

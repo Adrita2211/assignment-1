@@ -1,0 +1,355 @@
+# ecommerce-support-agent core infra: ECR, ECS cluster/service (Fargate)
+# with Service Auto Scaling, an ALB, RDS PostgreSQL + pgvector (the
+# locked-in vector store for this assignment -- replaces Assignment 1's
+# local FAISS index), and the two IAM roles (GitHub OIDC deploy role + ECS
+# task execution role). Adapted directly from agent-cicd-demo's own
+# agent-infra.yaml, per the assignment's own guidance to reuse that shape
+# rather than redesign it.
+#
+# The GitHub OIDC provider itself is account-wide and intentionally NOT
+# managed here -- other repos may depend on it, so it's created once via a
+# tiny separate script (infra/setup_oidc_provider.sh) and passed in as a
+# parameter.
+#
+# Deliberate boundary: this stack owns the INFRASTRUCTURE. GitHub Actions
+# owns WHICH IMAGE IS RUNNING -- every push registers a new task definition
+# revision and calls ecs:UpdateService directly, outside this stack. The
+# ContainerImage parameter only seeds the initial task definition; the
+# deploy wrapper script re-passes the currently-running image on every
+# subsequent `cloudformation deploy` so an unrelated infra change (e.g. a
+# security group rule) can never accidentally roll the service back to the
+# bootstrap placeholder image.
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  ecommerce-support-agent core infra: ECR, ECS Fargate + Service Auto
+  Scaling, an ALB, RDS PostgreSQL + pgvector, and the GitHub OIDC deploy
+  role + ECS task execution role. See inline comments for full rationale.
+
+Parameters:
+  AppName:
+    Type: String
+    Default: ecommerce-support-agent
+  GitHubOrg:
+    Type: String
+    Description: GitHub username or org
+  GitHubRepo:
+    Type: String
+    Description: Repo name this workflow lives in
+  GitHubOidcProviderArn:
+    Type: String
+    Description: ARN of the account's shared token.actions.githubusercontent.com OIDC provider
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+  ContainerImage:
+    Type: String
+    Description: Full ECR image URI:tag. Bootstrap value on first create; the currently-running image on every later update.
+  DbInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+    Description: Smallest class that runs pgvector -- this is a teaching deployment, not production (see README teardown discipline).
+  DbName:
+    Type: String
+    Default: supportagent
+  DbMasterUsername:
+    Type: String
+    Default: supportagent_admin
+  DbMasterPassword:
+    Type: String
+    NoEcho: true
+  MinTaskCount:
+    Type: Number
+    Default: 1
+  MaxTaskCount:
+    Type: Number
+    Default: 4
+  AutoscalingCpuTarget:
+    Type: Number
+    Default: 60
+    Description: Target-tracking CPU utilization percent for ECS Service Auto Scaling.
+
+Resources:
+  EcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref AppName
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AppName}"
+
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AppName}-cluster"
+
+  EcsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}-ecs-execution-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: !Sub "${AppName}-ssm-read"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameters
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AppName}/*"
+
+  # Two real gotchas, encoded here so they can never regress (see
+  # agent-cicd-demo's README): (1) configure-aws-credentials v4 tags every
+  # session by default, so sts:TagSession must be allowed alongside
+  # sts:AssumeRoleWithWebIdentity. (2) GitHub's OIDC `sub` claim carries
+  # stable numeric IDs suffixed onto the owner/repo names, not always the
+  # plain "repo:OWNER/REPO:ref:..." most docs show -- StringLike wildcards
+  # on both segments handle either format.
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AppName}-github-deploy-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Federated: !Ref GitHubOidcProviderArn }
+            Action: ["sts:AssumeRoleWithWebIdentity", "sts:TagSession"]
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubOrg}*/${GitHubRepo}*:*"
+      Policies:
+        - PolicyName: !Sub "${AppName}-deploy-policy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                Resource: !GetAtt EcrRepository.Arn
+              - Effect: Allow
+                Action:
+                  - ecs:RegisterTaskDefinition
+                  - ecs:DescribeTaskDefinition
+                  - ecs:UpdateService
+                  - ecs:DescribeServices
+                Resource: "*"
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt EcsExecutionRole.Arn
+
+  EcsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${AppName} task -- inbound 8080 from ALB only"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${AppName} ALB inbound 80"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  # RDS PostgreSQL + pgvector -- reachable only from the ECS task's own
+  # security group, never 0.0.0.0/0, per the assignment's §7.5 guidance.
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${AppName} RDS -- inbound 5432 from ECS tasks only"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref EcsSecurityGroup
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub "${AppName} RDS subnet group"
+      SubnetIds: !Ref SubnetIds
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub "${AppName}-db"
+      Engine: postgres
+      EngineVersion: "16"
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: "20"
+      DBName: !Ref DbName
+      MasterUsername: !Ref DbMasterUsername
+      MasterUserPassword: !Ref DbMasterPassword
+      VPCSecurityGroups: [!Ref DbSecurityGroup]
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      MultiAZ: false
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 0
+      StorageEncrypted: true
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${AppName}-alb"
+      Scheme: internet-facing
+      Type: application
+      Subnets: !Ref SubnetIds
+      SecurityGroups: [!Ref AlbSecurityGroup]
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${AppName}-tg"
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8080
+      VpcId: !Ref VpcId
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AppName}-task"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: "512"
+      Memory: "1024"
+      ExecutionRoleArn: !GetAtt EcsExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: !Ref AppName
+          Image: !Ref ContainerImage
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+          Environment:
+            - Name: AGENT_REGRESSED
+              Value: "false"
+            # Teaching-deployment simplification, called out explicitly: this
+            # embeds DbMasterPassword in plain text in the task definition
+            # (visible to anyone with ecs:DescribeTaskDefinition), not a
+            # Secrets Manager/SSM SecureString reference like GROQ_API_KEY
+            # below. A production hardening would generate a narrower DB
+            # user via a custom resource and pull DATABASE_URL from an SSM
+            # SecureString the same way the other secrets are wired.
+            - Name: DATABASE_URL
+              Value: !Sub "postgresql://${DbMasterUsername}:${DbMasterPassword}@${Database.Endpoint.Address}:${Database.Endpoint.Port}/${DbName}"
+          Secrets:
+            - Name: GROQ_API_KEY
+              ValueFrom: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AppName}/GROQ_API_KEY"
+            - Name: LANGFUSE_HOST
+              ValueFrom: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AppName}/LANGFUSE_HOST"
+            - Name: LANGFUSE_PUBLIC_KEY
+              ValueFrom: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AppName}/LANGFUSE_PUBLIC_KEY"
+            - Name: LANGFUSE_SECRET_KEY
+              ValueFrom: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AppName}/LANGFUSE_SECRET_KEY"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  EcsService:
+    Type: AWS::ECS::Service
+    DependsOn: Listener
+    Properties:
+      ServiceName: !Sub "${AppName}-service"
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref MinTaskCount
+      LaunchType: FARGATE
+      HealthCheckGracePeriodSeconds: 60
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !Ref SubnetIds
+          SecurityGroups: [!Ref EcsSecurityGroup]
+          AssignPublicIp: ENABLED
+      LoadBalancers:
+        - ContainerName: !Ref AppName
+          ContainerPort: 8080
+          TargetGroupArn: !Ref TargetGroup
+
+  # --- ECS Service Auto Scaling: target-tracking on CPU utilization ---
+  # Min/max task count and the CPU target are parameters (README documents
+  # the chosen values and the justification, per the assignment's §2.6.3).
+  ScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      ServiceNamespace: ecs
+      ResourceId: !Sub "service/${EcsCluster}/${EcsService.Name}"
+      ScalableDimension: ecs:service:DesiredCount
+      MinCapacity: !Ref MinTaskCount
+      MaxCapacity: !Ref MaxTaskCount
+
+  ScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "${AppName}-cpu-target-tracking"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: !Ref AutoscalingCpuTarget
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleInCooldown: 120
+        ScaleOutCooldown: 60
+
+Outputs:
+  AlbDnsName:
+    Value: !GetAtt LoadBalancer.DNSName
+  GitHubDeployRoleArn:
+    Value: !GetAtt GitHubDeployRole.Arn
+  EcrRepositoryUri:
+    Value: !GetAtt EcrRepository.RepositoryUri
+  EcsClusterName:
+    Value: !Ref EcsCluster
+  EcsServiceName:
+    Value: !GetAtt EcsService.Name
+  DbEndpoint:
+    Value: !GetAtt Database.Endpoint.Address
+  DbInstanceIdentifier:
+    Value: !Ref Database

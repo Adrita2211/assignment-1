@@ -17,6 +17,8 @@ from pathlib import Path
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from agent.pii import redact_value
+
 SERVER_SCRIPT = Path(__file__).resolve().parent.parent / "mcp_server" / "server.py"
 
 
@@ -46,11 +48,33 @@ class MCPToolClient:
         If the MCP layer rejects the call (bad schema, or the server's own
         SESSION_CUSTOMER_ID check), that shows up as {"error": ...} rather
         than raising, so callers can log/handle it uniformly.
+
+        PII enforcement point #2 (see agent/pii.py's module docstring):
+        every tool result and error payload passes through redact_value()
+        before returning here -- BEFORE it ever re-enters act_node's
+        state["messages"], which is what a downstream decide_node call
+        sends to Langfuse as the full message history. Fixing only the
+        final customer-facing reply does NOT close this leak, since a
+        tool result (e.g. check_account_status returning a raw email) is
+        never itself the final reply -- it's an intermediate message the
+        trace still captures in full. This is the real, found leak
+        documented in the README.
+
+        customer_id is unconditionally injected/overwritten here, on every
+        call, regardless of what's in `arguments` already -- mcp_server/server.py's
+        tools now take customer_id as a real parameter (the Gateway
+        migration's multi-tenant fix), but that value must NEVER come from
+        the model's own tool-call arguments (a manipulated prompt could
+        otherwise just claim to be a different customer and walk straight
+        past every ownership check). Centralizing the override here, not
+        at each call site in agent/harness.py, means it can't be forgotten
+        for a future tool.
         """
+        arguments = {**arguments, "customer_id": self.customer_id}
         try:
             result = await self.session.call_tool(name, arguments)
         except Exception as exc:  # MCP schema/validation errors surface here
-            return {"error": "mcp_layer_rejected", "detail": str(exc)}
+            return {"error": "mcp_layer_rejected", "detail": redact_value(str(exc))}
 
         text_parts = [block.text for block in result.content if getattr(block, "text", None)]
         payload = "\n".join(text_parts) if text_parts else "{}"
@@ -60,5 +84,5 @@ class MCPToolClient:
             parsed = {"raw": payload}
 
         if result.isError:
-            return {"error": "mcp_layer_rejected", "detail": parsed}
-        return parsed
+            return {"error": "mcp_layer_rejected", "detail": redact_value(parsed)}
+        return redact_value(parsed)

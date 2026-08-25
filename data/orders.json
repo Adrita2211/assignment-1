@@ -3,7 +3,11 @@
     "order_id": "ORD1001",
     "customer_id": "CUST001",
     "status": "delivered",
-    "items": ["Wireless Mouse", "USB-C Cable"],
+    "items": [
+      {"name": "Wireless Mouse", "price": 24.99},
+      {"name": "USB-C Cable", "price": 14.99}
+    ],
+    "order_total": 39.98,
     "order_date": "2026-07-10",
     "delivery_date": "2026-07-14"
   },
@@ -11,7 +15,10 @@
     "order_id": "ORD1002",
     "customer_id": "CUST002",
     "status": "in_transit",
-    "items": ["Mechanical Keyboard"],
+    "items": [
+      {"name": "Mechanical Keyboard", "price": 129.99}
+    ],
+    "order_total": 129.99,
     "order_date": "2026-07-20",
     "delivery_date": "2026-08-02"
   },
@@ -19,7 +26,10 @@
     "order_id": "ORD1003",
     "customer_id": "CUST001",
     "status": "delayed",
-    "items": ["27-inch Monitor"],
+    "items": [
+      {"name": "27-inch Monitor", "price": 249.00}
+    ],
+    "order_total": 249.00,
     "order_date": "2026-07-05",
     "delivery_date": "2026-07-15"
   },
@@ -27,7 +37,10 @@
     "order_id": "ORD1004",
     "customer_id": "CUST003",
     "status": "delivered",
-    "items": ["Bluetooth Headphones"],
+    "items": [
+      {"name": "Bluetooth Headphones", "price": 89.99}
+    ],
+    "order_total": 89.99,
     "order_date": "2026-06-28",
     "delivery_date": "2026-07-02"
   },
@@ -35,7 +48,10 @@
     "order_id": "ORD1005",
     "customer_id": "CUST004",
     "status": "delivered_damaged",
-    "items": ["Desk Lamp"],
+    "items": [
+      {"name": "Desk Lamp", "price": 64.50}
+    ],
+    "order_total": 64.50,
     "order_date": "2026-07-12",
     "delivery_date": "2026-07-16"
   },
@@ -43,7 +59,11 @@
     "order_id": "ORD1006",
     "customer_id": "CUST002",
     "status": "processing",
-    "items": ["Webcam", "Ring Light"],
+    "items": [
+      {"name": "Webcam", "price": 59.99},
+      {"name": "Ring Light", "price": 34.99}
+    ],
+    "order_total": 94.98,
     "order_date": "2026-07-27",
     "delivery_date": "2026-08-05"
   },
@@ -51,7 +71,10 @@
     "order_id": "ORD1007",
     "customer_id": "CUST005",
     "status": "delivered",
-    "items": ["Standing Desk"],
+    "items": [
+      {"name": "Standing Desk", "price": 399.00}
+    ],
+    "order_total": 399.00,
     "order_date": "2026-06-15",
     "delivery_date": "2026-06-22"
   },
@@ -59,7 +82,10 @@
     "order_id": "ORD1008",
     "customer_id": "CUST003",
     "status": "lost_in_transit",
-    "items": ["Graphic Tablet"],
+    "items": [
+      {"name": "Graphic Tablet", "price": 189.99}
+    ],
+    "order_total": 189.99,
     "order_date": "2026-07-08",
     "delivery_date": "2026-07-13"
   }

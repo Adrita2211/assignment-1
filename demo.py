@@ -21,9 +21,12 @@ import sys
 
 from dotenv import load_dotenv
 
+load_dotenv()  # must run before agent.tracing is imported (it reads LANGFUSE_PUBLIC_KEY at import time)
+
 from agent.harness import SupportHarness
 from agent.mcp_client import MCPToolClient
 from agent.rag import HybridPolicyRetriever
+from agent.tracing import langfuse
 
 
 def _banner(title: str):
@@ -101,7 +104,6 @@ async def run_malformed_call_demo():
 
 
 async def main():
-    load_dotenv()
     if not os.environ.get("GROQ_API_KEY"):
         print(
             "GROQ_API_KEY is not set. Copy .env.example to .env and put your "
@@ -113,6 +115,7 @@ async def main():
     await run_harness_permission_demo()
     await run_malformed_call_demo()
     _banner("Demo complete")
+    langfuse.flush()
 
 
 if __name__ == "__main__":
