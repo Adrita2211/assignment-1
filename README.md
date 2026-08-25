@@ -578,12 +578,17 @@ aws cloudformation describe-stacks --stack-name ecommerce-support-agent-infra \
   --query "Stacks[0].Outputs[?OutputKey=='AlbDnsName'].OutputValue" --output text
 ```
 
-**Live values for this deployment** (account `058264386876`, region `us-east-1`):
-- **ALB URL:** `http://ecommerce-support-agent-alb-580202083.us-east-1.elb.amazonaws.com`
-- **RDS endpoint:** `ecommerce-support-agent-db.cd8k6wsa4mwz.us-east-1.rds.amazonaws.com`
-- **GitHub deploy role ARN:** `arn:aws:iam::058264386876:role/ecommerce-support-agent-github-deploy-role`
+**Values as originally deployed** (account `058264386876`, region `us-east-1`)
+-- **the ALB and ECS service below were torn down 2026-08-25** (see section
+24) once the Assignment 3 AgentCore migration was verified live, per this
+project's own stated teardown plan; the URL/curl examples are kept for
+historical reference but will no longer resolve:
+- ~~**ALB URL:** `http://ecommerce-support-agent-alb-580202083.us-east-1.elb.amazonaws.com`~~ (deleted)
+- **RDS endpoint:** `ecommerce-support-agent-db.cd8k6wsa4mwz.us-east-1.rds.amazonaws.com` (instance still exists, stopped, not deleted -- see section 24)
+- **GitHub deploy role ARN:** `arn:aws:iam::058264386876:role/ecommerce-support-agent-github-deploy-role` (still live -- CI/CD's OIDC role, including the AgentCore deploy job, depends on this; deliberately left untouched)
 
 ```bash
+# No longer reachable -- kept to show the shape of the old ECS-fronted API.
 curl http://ecommerce-support-agent-alb-580202083.us-east-1.elb.amazonaws.com/health
 curl -X POST http://ecommerce-support-agent-alb-580202083.us-east-1.elb.amazonaws.com/chat \
   -H "Content-Type: application/json" \
@@ -1521,13 +1526,30 @@ and live-verified this session:
 6. ✅ HITL pause/resume and cost tracking verified live against the real
    Aurora-backed store, through the deployed AgentCore endpoint itself
    (section 18, section 21).
-7. **Not done, honestly flagged:** `agent/rag_bedrock_kb.py`'s `min_score`
-   empirical recalibration and the stale-connection proof (section 16),
-   and the Assignment 2 ECS/ALB/RDS CloudFormation stack teardown -- the
-   ECS stack is still live (section 11's resource names/ALB URL remain
-   accurate) and was deliberately **not** torn down yet, since full live
-   verification of every hardening piece wasn't complete when this
-   session's AWS budget/time ran out.
+7. **Still not done, honestly flagged:** `agent/rag_bedrock_kb.py`'s
+   `min_score` empirical recalibration and the stale-connection proof
+   (section 16).
+8. ✅ **The Assignment 2 ECS service and ALB were torn down 2026-08-25**
+   (`ecommerce-support-agent-service` scaled to 0 and deleted; the ALB,
+   its listener, and target group deleted directly via `aws ecs`/`aws
+   elbv2`, not a CloudFormation stack operation) -- this stops the two
+   resources that were actually accruing cost (the running Fargate task
+   and the ALB's hourly charge), which had continued for 17+ days past the
+   point this section's own plan said they should go. Deliberately **not**
+   a full `ecommerce-support-agent-infra` stack deletion: that stack's
+   `GitHubDeployRole` is still the OIDC role every job in
+   `.github/workflows/ci-cd.yml` assumes (including `deploy-agentcore`,
+   which this project still actively uses), and its `EcrRepository` still
+   holds images including the current ECS bootstrap image -- deleting
+   either would have broken still-in-use CI/CD, so both were left in
+   place along with the (already-stopped) RDS instance, the empty ECS
+   cluster, security groups, and the log group. This means the
+   `ecommerce-support-agent-infra` CloudFormation stack now has real drift
+   from what it thinks it owns (it still believes the service/ALB/target
+   group exist); a future `aws cloudformation update-stack` or
+   drift-detect against it will surface that, and should be resolved by
+   editing `infra/cloudformation/agent-infra.yaml` to remove those
+   resources properly rather than re-creating them by surprise.
 
 **The Aurora cluster was torn down a second time** (2026-08-25, this
 session) to stop the ACU-hour billing clock (Aurora Serverless v2 does not
