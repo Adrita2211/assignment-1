@@ -1014,13 +1014,21 @@ calibrated against, once a real Knowledge Base exists to test against.
 empirical `min_score` recalibration against real Bedrock KB scores, and the
 stale-connection proof (pointing `rag_pgvector.py` at an empty table to
 confirm the old path breaks while the new one still works), were not
-completed before this session's Aurora cluster was torn down to stop
-billing (see section 24) -- there wasn't a specific real-score-vs-threshold
-mismatch observed in practice during live testing (retrieval visibly
-worked correctly on every live query), but "worked in the cases tried"
-isn't the same as an empirically re-tuned threshold. Both are real
+completed before Aurora was torn down (again -- see section 24) to stop
+billing -- there wasn't a specific real-score-vs-threshold mismatch
+observed in practice during live testing (retrieval visibly worked
+correctly on every live query), but "worked in the cases tried" isn't the
+same as an empirically re-tuned threshold. Both are real
 `infra/create_kb_aurora.sh`-reproducible next steps once Aurora is
 re-provisioned for the final demo.
+
+**Currently broken, as of this session's teardown:** the deployed
+AgentCore Runtime's `BEDROCK_KNOWLEDGE_BASE_ID` (`GZVAPQMW1F`) still points
+at this Knowledge Base, but its backing Aurora pgvector store no longer
+exists (deleted this session, see section 24) -- retrieval calls against
+the live endpoint will fail until Aurora is re-provisioned. The Knowledge
+Base resource itself was left in place (cheap to keep, ingestion doesn't
+need to be redone once a new Aurora cluster is wired back in).
 
 ## 17. PII detection and redaction, layered (§2.4)
 
@@ -1472,11 +1480,18 @@ afterward: order lookup, PII masking, and a real Amazon Verified
 Permissions rejection (suspended account) all confirmed working through
 the CloudFormation-managed endpoint
 (`arn:aws:bedrock-agentcore:us-east-1:058264386876:runtime/ecommerce_agent-4ks2toDNhf`).
-Current stack parameters: `HITL_BACKEND=sqlite`, `COST_LEDGER_BACKEND=sqlite`,
-`BEDROCK_KNOWLEDGE_BASE_ID=""` (Aurora/KB intentionally still commented out
-in the template per the demo-sequencing note at its top) --
-`POLICY_BOUNDARY_BACKEND=avp` and `MEMORY_BACKEND=agentcore` are both real
-and live.
+**Current stack parameters, confirmed live via `aws bedrock-agentcore-control
+get-agent-runtime`** (superseding an earlier, now-stale version of this
+paragraph that predated a subsequent Aurora/KB re-provisioning):
+`HITL_BACKEND=aurora`, `COST_LEDGER_BACKEND=aurora`,
+`BEDROCK_KNOWLEDGE_BASE_ID=GZVAPQMW1F`, `POLICY_BOUNDARY_BACKEND=avp`,
+`MEMORY_BACKEND=agentcore` -- all real and, as of Aurora's most recent
+teardown (below), partially live: Memory/PII/policy-boundary/order-lookup
+are unaffected, but the `aurora`-backed HITL store, cost ledger, and KB
+retrieval will fail against the live endpoint until Aurora is
+re-provisioned. This paragraph is a live snapshot, not a static fact --
+re-verify with the same `get-agent-runtime` call rather than trusting it
+blindly after any future deploy.
 
 **The AWS provisioning batch ran for real.** In order, all actually done
 and live-verified this session:
@@ -1514,14 +1529,25 @@ and live-verified this session:
    verification of every hardening piece wasn't complete when this
    session's AWS budget/time ran out.
 
-**The Aurora cluster and Bedrock Knowledge Base were torn down at the end
-of this session** to stop the ACU-hour billing clock (Aurora Serverless v2
-does not scale to zero the way Serverless v1's auto-pause did -- it bills
+**The Aurora cluster was torn down a second time** (2026-08-25, this
+session) to stop the ACU-hour billing clock (Aurora Serverless v2 does not
+scale to zero the way Serverless v1's auto-pause did -- it bills
 continuously at its configured minimum ACU whether or not it's handling
-traffic), per this project's "provision, verify, tear down" cost discipline.
-`infra/create_kb_aurora.sh` / `infra/teardown_kb_aurora.sh` make this
-reproducible for a final demo pass: re-run `create_kb_aurora.sh`, re-deploy
-AgentCore with the new resource ARNs, and everything above is
+traffic), per this project's "provision, verify, tear down" cost
+discipline. It had been re-provisioned since an earlier teardown (the
+long-term-memory and KB-retrieval verification throughout sections 15-16
+happened against that live re-provisioned cluster), so this is the second
+full provision-verify-teardown cycle, not the first. Deleted directly via
+`aws rds delete-db-instance` / `delete-db-cluster` (`--skip-final-snapshot`
+-- no snapshot retained, so this is genuinely zero ongoing Aurora cost, not
+just cheaper), confirmed against a live AWS check that the cluster was
+never CloudFormation-managed (created out-of-band by
+`infra/create_kb_aurora.sh`, so this didn't touch `ecommerce-agentcore-infra`
+stack state). The Bedrock Knowledge Base resource (`GZVAPQMW1F`) itself was
+left in place -- see section 16's note on what's currently broken as a
+result. `infra/create_kb_aurora.sh` / `infra/teardown_kb_aurora.sh` make
+this reproducible for a final demo pass: re-run `create_kb_aurora.sh`,
+re-deploy AgentCore with the new resource ARNs, and everything above is
 re-verifiable from a clean state. The AgentCore Runtime deployment and the
 Verified Permissions policy store were left running (their idle cost is
 negligible compared to Aurora's continuous ACU billing).
@@ -1576,3 +1602,81 @@ Presidio's local, no-network operation also means it never depends on
 Bedrock being reachable and has zero per-call AWS cost, which stays true
 regardless of the coverage comparison.
 
+## 26. Known gaps and improvement opportunities (post-Assignment-3 review)
+
+Found during a 2026-08-25 review of this branch against the §2/§3 spec
+above. All code-verified against the actual repo state, not guessed --
+none of these block what Assignment 3 asks for; they're real next steps.
+
+**In scope of Assignment 3's own stated goals:**
+
+- **`eval/hitl_bug_repro.py` isn't wired into CI.** Section 18 calls it "a
+  permanent regression test, not thrown away," but neither `eval-gate`
+  (blocking) nor `full-eval-report` (manual, `eval/report.py`) actually
+  imports or runs it -- `eval/report.py`'s `SECTIONS` covers trajectory,
+  judge, policy_adherence, safety, robustness, calibration, longitudinal,
+  but not this one. The Double Refund fix (section 18) has no automated
+  protection against a future regression; it currently only gets re-run if
+  someone remembers to type `python -m eval.hitl_bug_repro` by hand.
+  Fixable by adding it as its own fast `eval-gate` step (it's a local
+  SQLite repro, no live model call, so it wouldn't add real CI time the way
+  the Groq-backed trajectory eval does).
+- **`eval/semantic_cache_demo.py` (section 22) has the same gap** --
+  demonstrates the cache works today, with no CI check that a future change
+  to `agent/semantic_cache.py` or its threshold doesn't silently break the
+  9.8x hit-path behavior.
+- **The `min_score` recalibration for `agent/rag_bedrock_kb.py` (section
+  16) is still open**, honestly flagged in the README itself, and now
+  blocked again on Aurora being torn down for the second time (section 24).
+  Worth doing in the same session as the next `create_kb_aurora.sh` run
+  rather than deferring again.
+- **README section 24's "current stack parameters" paragraph had drifted
+  from the live deployed state** before this review (it said
+  `HITL_BACKEND=sqlite`/`COST_LEDGER_BACKEND=sqlite`/empty KB ID; the real
+  running Runtime had `aurora`/`aurora`/`GZVAPQMW1F`, confirmed via
+  `aws bedrock-agentcore-control get-agent-runtime`) -- fixed in this
+  review, but it's a symptom of a general pattern: nothing in CI checks
+  that README claims about live AWS state stay in sync with reality after
+  a manual `agentcore deploy`. A cheap fix: a small script that runs
+  `get-agent-runtime` and diffs its `environmentVariables` against a
+  checked-in expected-state file, run in CI (non-blocking, just a drift
+  warning).
+
+**Broader, not required by Assignment 3, but worth citing:**
+
+- **`requirements.txt` pins only 1 of 18 dependencies exactly**
+  (`mcp[cli]==1.9.4`); everything else is an unbounded `>=`. Given how much
+  of this project's credibility rests on "verified, reproducible" claims
+  (every README section documents exact commands and exact output), an
+  unpinned `langgraph>=0.2.0` or `pydantic>=2.0` picking up a new major
+  version on a fresh `pip install` is a real, silent way for those
+  verified claims to stop being reproducible. Worth either pinning exact
+  versions or adding upper bounds, plus a `pip freeze`-style lockfile
+  checked into CI.
+- **No pytest-based unit test suite for the pure-logic modules** --
+  `agent/policy_boundary.py`'s four branches, `agent/hitl_store.py`'s
+  state-machine transitions, `agent/pii.py`'s custom recognizers, and
+  `agent/cost_ledger.py`'s aggregation functions are all currently verified
+  only via one-off scripts whose output is captured into README prose
+  (real and honest, but not re-run automatically). These are exactly the
+  kind of deterministic, non-LLM logic that's cheap to cover with real
+  `pytest` assertions and would catch a regression in seconds instead of
+  requiring someone to notice a README example no longer matches reality.
+- **The AVP policy store, Bedrock Guardrail, and Bedrock Knowledge Base are
+  all provisioned by hand (CLI/console), unlike the Runtime/Memory pair**,
+  which now has `infra/cloudformation/agentcore-infra.yaml`. `infra/
+  create_kb_aurora.sh` covers Aurora+KB reproducibly, but the Guardrail and
+  AVP policy store/schema/policies still aren't captured as code anywhere
+  in this repo -- meaning "provision, verify, tear down" is only fully
+  reproducible for two of the four provisioned AWS services. Worth adding
+  CFN (or even just idempotent CLI scripts, matching the Aurora precedent)
+  for the other two, especially since this session's Aurora teardown is a
+  direct demonstration of how often a from-scratch reprovision actually
+  happens on this project.
+- **No automated cost alerting.** The whole "provision, verify, tear down"
+  discipline documented throughout this README is currently a manual
+  habit, not a guardrail -- nothing pages anyone (or auto-tears-down) if a
+  future session forgets the teardown step. An AWS Budget with a
+  threshold alarm on this account, or a scheduled Lambda that flags any
+  Aurora cluster older than N hours, would make the discipline this project
+  already values enforceable rather than just documented.
