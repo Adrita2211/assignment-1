@@ -16,15 +16,6 @@
 # block below was likewise validated for real via an isolated
 # `aws cloudformation create-change-set` (non-colliding AppName, not
 # executed) before being enabled here.
-#
-# IMPORTANT, read the Aurora/KB block's own header comment before
-# deploying it: the Aurora cluster and Knowledge Base currently live in
-# this account were created by infra/create_kb_aurora.sh's imperative CLI
-# calls, not by this stack, so a plain deploy of this template as-is will
-# collide on the DBCluster identifier. The Runtime resource references
-# AuroraClusterArn/AuroraSecretArn/BedrockKnowledgeBaseId as *parameters*
-# (not !Ref/!GetAtt against the Aurora/KB resources below), so the two
-# halves of this template can be deployed independently of each other.
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   Bedrock AgentCore Runtime + Memory, plus Aurora Serverless v2 + pgvector
@@ -275,23 +266,6 @@ Resources:
   # via a real `aws cloudformation create-change-set` (isolated, with a
   # non-colliding AppName, not executed) before uncommenting here --
   # CREATE_COMPLETE, no schema issues found.
-  #
-  # *** REAL, LIVE CAVEAT, READ BEFORE DEPLOYING THIS BLOCK ***
-  # The Aurora cluster/instance and Knowledge Base currently live in this
-  # account (ecommerce-agent-kb-aurora, KB id GZVAPQMW1F) were created by
-  # infra/create_kb_aurora.sh's imperative CLI calls, NOT by this
-  # CloudFormation stack -- they are unmanaged by CloudFormation, referenced
-  # by this stack only as parameter values (AuroraClusterArn/
-  # AuroraSecretArn/BedrockKnowledgeBaseId on the Outputs/Runtime side).
-  # If you deploy THIS block as-is against the SAME account, CloudFormation
-  # will try to CREATE a new DBCluster with the identifier
-  # "ecommerce-agent-kb-aurora" -- which already exists -- and fail with
-  # DBClusterAlreadyExistsFault. Before deploying this block for real,
-  # either (a) change AppName so the identifiers don't collide with the
-  # script-created resources, (b) tear down the script-created Aurora/KB
-  # first (infra/teardown_kb_aurora.sh), or (c) import the existing
-  # resources into this stack's management via `aws cloudformation
-  # create-change-set --change-set-type IMPORT` instead of a normal deploy.
   #
   # After a successful deploy: take the outputs (AuroraClusterArnOut,
   # AuroraSecretArnOut, KnowledgeBaseIdOut) and redeploy this SAME stack
