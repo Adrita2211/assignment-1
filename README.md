@@ -731,7 +731,7 @@ handoff, real tool calls documented in the file.
 
 **Actually deployed and live-invoked, not just code-complete.** The agent
 runs on a real AgentCore Runtime endpoint:
-`arn:aws:bedrock-agentcore:us-east-1:058264386876:runtime/ecommerce_support_agent-923Khb438X`.
+`arn:aws:bedrock-agentcore:us-east-1:058264386876:runtime/ecommerce_agent-4ks2toDNhf`.
 
 `agentcore_app.py` (repo root) wraps the existing `SupportHarness` in
 `BedrockAgentCoreApp` with a deliberately minimal `@app.entrypoint` --
